@@ -1,0 +1,13 @@
+import "mbuild/api";
+
+// raize_api: JSON APIs on raize: typed requests, problem details, OpenAPI 3.1, pagination
+// Library only, no bins.
+fn project() {
+  mb_package("raize_api", "0.1.0");
+  mb_meta("description", "JSON APIs on raize: typed requests, problem details, OpenAPI 3.1, pagination");
+  mb_meta("license", "Apache-2.0");
+}
+
+// raize packages by path until raize is published; publish switches these to mb_dep.
+fn deps() {
+}
