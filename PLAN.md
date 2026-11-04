@@ -14,6 +14,7 @@ caching and safety headers.
 | `raize` (umbrella) | `RzApp` and the declaration function; RaizeAPI exposes `rapi_*(app, ...)` calls used inside it |
 | `json` (registry) | strict RFC 8259 pull reader for request bodies |
 | `codec` | JSON writer for responses; protobuf later for the gRPC gateway |
+| `press` | gzip, deflate and zstd for Content-Encoding (request bodies with output limits, streaming responses) |
 | `raize_auth` | API tokens, scopes, policies (optional, the app opts in) |
 | `flux_orm` | data layer behind resources; reached only through raize_resource's vtable |
 
@@ -38,7 +39,8 @@ src/
   query/                pagination (offset and cursor), filter, sort, sparse fields
   jsonapi/              optional JSON:API 1.1 documents, includes, errors
   openapi/              OpenAPI 3.1 + JSON Schema 2020-12 generation, docs page route
-  negotiate/            Accept / Content-Type negotiation, 406/415
+  negotiate/            Accept / Content-Type negotiation, 406/415, Content-Encoding
+                        and Accept-Encoding via press
   cache/                ETag (strong and weak), If-None-Match / If-Match, Cache-Control
   idempotency/          Idempotency-Key store and replay
   ratelimit/            token bucket per key, RateLimit headers
@@ -59,7 +61,7 @@ docs/                   guide, standards.md, references.md
    with problem details.
 5. OpenAPI 3.1 document and docs page, checked with an OpenAPI validator.
 6. Pagination, filtering, sorting, sparse fields.
-7. Content negotiation, ETags and caching, CORS presets.
+7. Content negotiation and compression, ETags and caching, CORS presets.
 8. Idempotency keys, rate limiting.
 9. Auth via raize_auth (tokens, scopes, policies).
 10. Optional JSON:API 1.1.
