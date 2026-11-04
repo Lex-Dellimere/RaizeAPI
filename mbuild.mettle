@@ -1,13 +1,14 @@
 import "mbuild/api";
 
 // raize_api: JSON APIs on raize: typed requests, problem details, OpenAPI 3.1, pagination
-// Library only, no bins.
+// Library; its one bin is the example_todos example.
 fn project() {
   mb_package("raize_api", "0.1.0");
   mb_meta("description", "JSON APIs on raize: typed requests, problem details, OpenAPI 3.1, pagination");
   mb_meta("license", "Apache-2.0");
   mb_meta("repository", "https://github.com/Lex-Dellimere/RaizeAPI");
   mb_import_root("src");
+  mb_bin("example_todos", "examples/todos/main.mettle");
 }
 
 // raize packages by path until raize is published; publish switches these to mb_dep.

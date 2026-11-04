@@ -1,0 +1,119 @@
+// examples/todos: a versioned JSON API on raize.
+//
+//   GET    /api/v1/todos            page of todos (limit, offset, sort, filter, fields)
+//   POST   /api/v1/todos            create (Bearer token "secret", scope todos:write)
+//   GET    /api/v1/todos/:id        one todo, with an ETag
+//   PATCH  /api/v1/todos/:id        change (token needed)
+//   DELETE /api/v1/todos/:id        delete (token needed)
+//   POST   /api/v1/todos/:id/toggle flip done (token needed)
+//   GET    /api/v1/stats            a hand-written operation
+//   GET    /api/openapi.json        the OpenAPI 3.1 document
+//   GET    /api/docs                the docs page
+//
+// Build and run:
+//   mbuild build example_todos
+//   ./build/linux/debug/example_todos --port 8090
+//   curl -s localhost:8090/api/v1/todos
+//   curl -s -X POST localhost:8090/api/v1/todos -H 'Authorization: Bearer secret' \
+//        -H 'Content-Type: application/json' -H 'Idempotency-Key: "k1"' -d '{"title":"milk"}'
+import "std/mem";
+import "raize_core/core/status";
+import "raize_resource/resource";
+import "raize_api/raize_api";
+import "raize_api/types/model";
+
+// The record the resource stores. raize's @resource decorator would write the
+// definition below; it is spelled out here so the example builds without rzpp.
+struct Todo {
+  id: int64;
+  title: string;
+  done: bool;
+}
+
+var g_todo_def: RzResourceDef;
+var g_todos: RzDataLayer* = 0;
+
+fn todo_toggle(rec: rawptr) {
+  var t: Todo* = (Todo*)rec;
+  t->done = !t->done;
+}
+
+fn todo_resource() -> RzResourceDef* {
+  if (g_todo_def.ready) { return &g_todo_def; }
+  rz__resource_begin(&g_todo_def, "todo", "Todo", (int64)sizeof(Todo));
+  comptime for f in typeof(Todo).fields {
+    rz__resource_field(&g_todo_def, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
+  rz__attr_required(&g_todo_def, 1);
+  rz__attr_max_length(&g_todo_def, 1, 120);
+  rz__action_create(&g_todo_def, (int64)2);
+  rz__action_read(&g_todo_def);
+  rz__action_update(&g_todo_def, (int64)6);
+  rz__action_destroy(&g_todo_def);
+  rz__action_custom(&g_todo_def, "toggle", &todo_toggle);
+  rz__resource_end(&g_todo_def);
+  return &g_todo_def;
+}
+
+@rapi_model struct Stats {
+  total: int64;
+  done: int64;
+}
+
+fn get_stats(r: RapiReq*) -> int32 {
+  var recs: RzRecords;
+  if (rz__read(g_todos, todo_resource(), &recs, r->ctx->arena) != RZ_OK) { return rapi_fail(r, 500, ""); }
+  var s: Stats;
+  s.total = (int64)recs.count;
+  s.done = 0;
+  var items: Todo* = (Todo*)recs.items;
+  for i in 0..recs.count {
+    if (items[i].done) { s.done = s.done + 1; }
+  }
+  return rapi_json(r, 200, Stats_rapi(), (rawptr)&s);
+}
+
+// A real app checks the token against raize_auth's token store.
+fn verify(r: RapiReq*, token: string) -> bool {
+  if (token != "secret") { return false; }
+  r->subject = "demo";
+  r->scopes = "todos:write";
+  return true;
+}
+
+fn todos_app(app: RzApp*) {
+  rz_default(app, "port", "8090");
+  g_todos = rz_mem_layer(app, todo_resource(), 256);
+
+  var api: RapiApi* = rapi_new(app, "/api", "Todos", "1.0.0");
+  rapi_describe_api(api, "A small todo list API built with RaizeAPI.");
+  rapi_use_cors(api, "*", false, 600);
+  rapi_use_bearer(api, "todos", &verify);
+  rapi_use_rate_limit(api, 120, 60);
+  rapi_use_idempotency(api, 3600, 1024);
+  rapi_use_negotiation(api);
+  rapi_use_etags(api);
+  rapi_use_compression(api, 1024);
+
+  rapi_group(api, "/v1");
+  rapi_resource(api, "/todos", todo_resource(), g_todos);
+  for i in 0..api->nops {
+    var op: RapiOp* = api->ops[i];
+    if (op->verb != "GET") {
+      rapi_secure(op, "todos:write");
+      rapi_idempotent(op, false);
+    }
+  }
+  var op: RapiOp* = rapi_get(api, "/stats", &get_stats);
+  rapi_summary(op, "Count todos");
+  rapi_tag(op, "Todo");
+  rapi_returns(op, 200, Stats_rapi(), "The counts");
+  rapi_cache(op, "max-age=5");
+  rapi_group_end(api);
+
+  if (rapi_error(api).length > 0) { rz__app_error(app, rapi_error(api)); }
+}
+
+fn main() -> int32 {
+  return rz_run("todos", &todos_app);
+}
