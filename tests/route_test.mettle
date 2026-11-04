@@ -1,0 +1,183 @@
+// Routing, parameters, bodies, problems and the OpenAPI document.
+import "std/mem";
+import "raize_api/raize_api";
+import "raize_api/types/model";
+import "json";
+import "tutil";
+import "http";
+
+@rapi_model struct NewTask {
+  title: string;
+  prio: int32;
+}
+
+@rapi_model struct Task {
+  id: int64;
+  title: string;
+  prio: int32;
+}
+
+fn get_task(r: RapiReq*) -> int32 {
+  var t: Task;
+  t.id = rapi_int(r, "id");
+  t.title = "milk";
+  t.prio = 1;
+  if (t.id == 404) { return rapi_fail(r, 404, "no task 404"); }
+  return rapi_json(r, 200, Task_rapi(), (rawptr)&t);
+}
+
+fn new_task_page(r: RapiReq*) -> int32 { return rapi_json_text(r, 200, "\"form\""); }
+
+fn create_task(r: RapiReq*) -> int32 {
+  var in: NewTask* = (NewTask*)rapi_body_of(r);
+  var t: Task;
+  t.id = 7;
+  t.title = in->title;
+  t.prio = in->prio;
+  return rapi_created(r, "/api/v1/tasks/7", Task_rapi(), (rawptr)&t);
+}
+
+fn list_tasks(r: RapiReq*) -> int32 {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, "{{\"limit\":");
+  rz_buf_add_int(b, rapi_int(r, "limit"));
+  rz_buf_add(b, ",\"tags\":");
+  rz_buf_add_int(b, rapi_count(r, "tag"));
+  rz_buf_add(b, ",\"first\":\"");
+  rz_buf_add(b, rapi_str_at(r, "tag", 0));
+  rz_buf_add(b, "\"}");
+  var st: int32 = rapi_json_text(r, 200, rz_buf_str(b));
+  rz_buf_free(b);
+  return st;
+}
+
+fn build() -> RapiApi* {
+  var api: RapiApi* = rapi_new((RzApp*)0, "/api", "Tasks", "1.0.0");
+  var nt: RapiType* = NewTask_rapi();
+  rapi_len(rapi_field_type(nt, "title"), 1, 20);
+  rapi_range(rapi_field_type(nt, "prio"), 1, 5);
+  rapi_require(nt, "prio", false);
+  rapi_read_only(Task_rapi(), "id");
+  rapi_group(api, "/v1");
+  rapi_group_tag(api, "tasks");
+  var op: RapiOp* = rapi_get(api, "/tasks/:id", &get_task);
+  rapi_summary(op, "Get a task");
+  rapi_path_param(op, "id", rapi_range(rapi_int64_t(), 1, RAPI_UNSET), "Task id");
+  rapi_returns(op, 200, Task_rapi(), "The task");
+  rapi_get(api, "/tasks/new", &new_task_page);
+  op = rapi_post(api, "/tasks", &create_task);
+  rapi_body(op, NewTask_rapi());
+  rapi_returns(op, 201, Task_rapi(), "Created");
+  op = rapi_get(api, "/tasks", &list_tasks);
+  rapi_query(op, "limit", rapi_range(rapi_int32_t(), 1, 100), false, "Page size");
+  rapi_param_default(op, "limit", "20");
+  rapi_query(op, "tag", rapi_array_t(rapi_string_t()), false, "Filter by tag");
+  rapi_returns_list(op, 200, Task_rapi(), "Tasks");
+  rapi_group_end(api);
+  rapi_group(api, "/v0");
+  rapi_group_deprecate(api, 1700000000, 1800000000);
+  rapi_get(api, "/tasks/:id", &get_task);
+  rapi_group_end(api);
+  return api;
+}
+
+fn main() -> int32 {
+  var api: RapiApi* = build();
+  t_str("no decl errors", rapi_error(api), "");
+
+  var h: THttp* = t_req("GET", "/api/v1/tasks/3", "", "", "");
+  t_eq("get", rapi_handle(api, &h->ctx), 200);
+  t_str("get body", t_body(h), "{{\"id\":3,\"title\":\"milk\",\"prio\":1}");
+
+  h = t_req("HEAD", "/api/v1/tasks/3", "", "", "");
+  t_eq("head", rapi_handle(api, &h->ctx), 200);
+
+  h = t_req("GET", "/api/v1/tasks/new", "", "", "");
+  t_eq("static wins", rapi_handle(api, &h->ctx), 200);
+  t_str("static body", t_body(h), "\"form\"");
+
+  h = t_req("GET", "/api/v1/tasks/abc", "", "", "");
+  t_eq("bad id", rapi_handle(api, &h->ctx), 400);
+  t_has("bad id body", t_body(h), "{{\"detail\":\"must be an integer\",\"parameter\":\"id\",\"in\":\"path\"}");
+  t_str("problem ct", t_hdr(h, "Content-Type"), "application/problem+json");
+
+  h = t_req("GET", "/api/v1/tasks/0", "", "", "");
+  t_eq("id range", rapi_handle(api, &h->ctx), 400);
+
+  h = t_req("GET", "/api/v1/tasks/404", "", "", "");
+  t_eq("handler 404", rapi_handle(api, &h->ctx), 404);
+  t_has("handler 404 body", t_body(h), "\"detail\":\"no task 404\"");
+
+  h = t_req("GET", "/api/v1/nothing", "", "", "");
+  t_eq("404", rapi_handle(api, &h->ctx), 404);
+  t_has("404 body", t_body(h), "\"title\":\"Not Found\",\"status\":404");
+
+  h = t_req("DELETE", "/api/v1/tasks/3", "", "", "");
+  t_eq("405", rapi_handle(api, &h->ctx), 405);
+  t_str("allow", t_hdr(h, "Allow"), "GET, HEAD, OPTIONS");
+
+  h = t_req("OPTIONS", "/api/v1/tasks", "", "", "");
+  t_eq("options", rapi_handle(api, &h->ctx), 204);
+  t_str("options allow", t_hdr(h, "Allow"), "GET, HEAD, POST, OPTIONS");
+
+  h = t_req("POST", "/api/v1/tasks", "", "{{\"title\":\"buy\",\"prio\":2}", "Content-Type: application/json");
+  t_eq("create", rapi_handle(api, &h->ctx), 201);
+  t_str("create body", t_body(h), "{{\"id\":7,\"title\":\"buy\",\"prio\":2}");
+  t_str("location", t_hdr(h, "Location"), "/api/v1/tasks/7");
+
+  h = t_req("POST", "/api/v1/tasks", "", "{{\"title\":\"\",\"prio\":9,\"x\":1}", "Content-Type: application/json; charset=utf-8");
+  t_eq("create 422", rapi_handle(api, &h->ctx), 422);
+  t_has("422 title", t_body(h), "\"pointer\":\"#/title\"");
+  t_has("422 prio", t_body(h), "{{\"detail\":\"must be at most 5\",\"pointer\":\"#/prio\"}");
+
+  h = t_req("POST", "/api/v1/tasks", "", "{{\"title\":", "Content-Type: application/json");
+  t_eq("create 400", rapi_handle(api, &h->ctx), 400);
+
+  h = t_req("POST", "/api/v1/tasks", "", "title=x", "Content-Type: application/x-www-form-urlencoded");
+  t_eq("create 415", rapi_handle(api, &h->ctx), 415);
+
+  h = t_req("POST", "/api/v1/tasks", "", "", "");
+  t_eq("no body", rapi_handle(api, &h->ctx), 400);
+
+  h = t_req("GET", "/api/v1/tasks", "tag=a&tag=b", "", "");
+  t_eq("list", rapi_handle(api, &h->ctx), 200);
+  t_str("list body", t_body(h), "{{\"limit\":20,\"tags\":2,\"first\":\"a\"}");
+
+  h = t_req("GET", "/api/v1/tasks", "limit=500", "", "");
+  t_eq("limit range", rapi_handle(api, &h->ctx), 400);
+  h = t_req("GET", "/api/v1/tasks", "limit=5&limit=6", "", "");
+  t_eq("limit twice", rapi_handle(api, &h->ctx), 400);
+
+  h = t_req("GET", "/api/v0/tasks/1", "", "", "");
+  t_eq("v0", rapi_handle(api, &h->ctx), 200);
+  t_str("deprecation", t_hdr(h, "Deprecation"), "@1700000000");
+  t_str("sunset", t_hdr(h, "Sunset"), "Fri, 15 Jan 2027 08:00:00 GMT");
+
+  h = t_req("GET", "/api/openapi.json", "", "", "");
+  t_eq("openapi", rapi_handle(api, &h->ctx), 200);
+  var doc: string = t_body(h);
+  var rd: JsonReader;
+  json_begin(&rd, doc);
+  var ev: int32 = json_next(&rd);
+  while (ev != JSON_END && ev != JSON_ERROR) { ev = json_next(&rd); }
+  t_ok("openapi is JSON", ev == JSON_END);
+  t_has("openapi version", doc, "\"openapi\":\"3.1.0\"");
+  t_has("openapi path", doc, "\"/v1/tasks/{{id}\":{{\"get\":{{\"operationId\":\"getV1TasksId\",\"summary\":\"Get a task\",\"tags\":[\"tasks\"]");
+  t_has("openapi param", doc, "{{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"description\":\"Task id\",\"schema\":{{\"type\":\"integer\",\"format\":\"int64\",\"minimum\":1}}");
+  t_has("openapi ref", doc, "\"schema\":{{\"$ref\":\"#/components/schemas/Task\"}");
+  t_has("openapi schema", doc, "\"Task\":{{\"type\":\"object\",\"properties\":{{\"id\":{{\"type\":\"integer\",\"format\":\"int64\",\"readOnly\":true}");
+  t_has("openapi deprecated", doc, "\"deprecated\":true");
+  t_has("openapi list param", doc, "\"style\":\"form\",\"explode\":true");
+
+  h = t_req("GET", "/api/docs", "", "", "");
+  t_eq("docs", rapi_handle(api, &h->ctx), 200);
+  t_has("docs body", t_body(h), "swagger-ui-bundle.js");
+
+  var bad: RapiApi* = rapi_new((RzApp*)0, "/x", "Bad", "1");
+  rapi_get(bad, "/a/:i:d", &get_task);
+  t_has("bad template", rapi_error(bad), "bad path template");
+  rapi_get(bad, "/b/:id", &get_task);
+  rapi_get(bad, "/b/:other", &get_task);
+  t_eq("dup", (int64)bad->errors, 2);
+  return t_done();
+}

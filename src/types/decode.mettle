@@ -102,15 +102,16 @@ fn rapi__take_string(d: RapiDecoder*) -> string {
   return rz_str_view(p, got);
 }
 
-/// Checks a decoded string against `t`'s constraints, adding errors at `ptr`.
-export fn rapi_check_string(d: RapiDecoder*, t: RapiType*, s: string, ptr: string) {
+/// What is wrong with string `s` as a value of `t`, or "" when it is fine.
+/// The text lives in `arena`.
+export fn rapi_string_issue(t: RapiType*, s: string, arena: RzArena*) -> string {
   var cps: int64 = rapi_utf8_count(s);
-  if (cps < 0) { rapi__err(d, ptr, "must be valid UTF-8"); return; }
+  if (cps < 0) { return "must be valid UTF-8"; }
   if (t->min_len != RAPI_UNSET && cps < t->min_len) {
-    rapi__err(d, ptr, "must be at least {t->min_len} characters");
+    return rz_arena_str(arena, "must be at least {t->min_len} characters");
   }
   if (t->max_len != RAPI_UNSET && cps > t->max_len) {
-    rapi__err(d, ptr, "must be at most {t->max_len} characters");
+    return rz_arena_str(arena, "must be at most {t->max_len} characters");
   }
   if (t->nenum > 0) {
     var hit: bool = false;
@@ -124,30 +125,27 @@ export fn rapi_check_string(d: RapiDecoder*, t: RapiType*, s: string, ptr: strin
         if (i > 0) { rz_buf_add(b, ", "); }
         rz_buf_add(b, t->enum_vals[i]);
       }
-      rapi__err(d, ptr, rz_buf_str(b));
+      var out: string = rz_arena_str(arena, rz_buf_str(b));
       rz_buf_free(b);
+      return out;
     }
   }
   if (t->format.length > 0 && !rapi_format_ok(t->format, s)) {
-    rapi__err(d, ptr, "must be a valid {t->format}");
+    return rz_arena_str(arena, "must be a valid {t->format}");
   }
+  return "";
 }
 
-/// Checks an integer against `t`'s range (and int32 storage), adding errors at `ptr`.
-export fn rapi_check_int(d: RapiDecoder*, t: RapiType*, v: int64, ptr: string) -> bool {
+/// What is wrong with integer `v` as a value of `t`, or "" when it is fine.
+export fn rapi_int_issue(t: RapiType*, v: int64, arena: RzArena*) -> string {
   if (t->minimum != RAPI_UNSET && v < t->minimum) {
-    rapi__err(d, ptr, "must be at least {t->minimum}");
-    return false;
+    return rz_arena_str(arena, "must be at least {t->minimum}");
   }
   if (t->maximum != RAPI_UNSET && v > t->maximum) {
-    rapi__err(d, ptr, "must be at most {t->maximum}");
-    return false;
+    return rz_arena_str(arena, "must be at most {t->maximum}");
   }
-  if (t->size == 4 && (v < -2147483648 || v > 2147483647)) {
-    rapi__err(d, ptr, "is out of range");
-    return false;
-  }
-  return true;
+  if (t->size == 4 && (v < -2147483648 || v > 2147483647)) { return "is out of range"; }
+  return "";
 }
 
 fn rapi__store_int(dst: rawptr, size: int64, v: int64) {
@@ -185,7 +183,8 @@ fn rapi__value(d: RapiDecoder*, t: RapiType*, dst: rawptr, ev: int32, ptr: strin
       return rapi__skip(d, ev);
     }
     var s: string = rapi__take_string(d);
-    rapi_check_string(d, t, s, ptr);
+    var issue: string = rapi_string_issue(t, s, d->arena);
+    if (issue.length > 0) { rapi_errors_body(d->errs, ptr, issue); }
     *(string*)dst = s;
     return true;
   }
@@ -199,7 +198,9 @@ fn rapi__value(d: RapiDecoder*, t: RapiType*, dst: rawptr, ev: int32, ptr: strin
       rapi__err(d, ptr, "must be an integer");
       return true;
     }
-    if (rapi_check_int(d, t, v, ptr)) { rapi__store_int(dst, t->size, v); }
+    var issue: string = rapi_int_issue(t, v, d->arena);
+    if (issue.length > 0) { rapi_errors_body(d->errs, ptr, issue); }
+    else { rapi__store_int(dst, t->size, v); }
     return true;
   }
   if (k == RAPI_T_NUMBER) {

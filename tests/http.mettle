@@ -1,0 +1,48 @@
+// Builds fake requests for rapi_handle and reads the responses.
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/header";
+
+export struct THttp {
+  ctx: RzContext;
+  req: RzRequest;
+  resp: RzResponse*;
+  arena: RzArena*;
+}
+
+var g_t_arena: RzArena* = 0;
+
+/// A request: verb, path ("/api/x"), query ("a=1&b=2" or ""), body ("" for none).
+/// headers: "Name: value\n" lines, or "".
+export fn t_req(verb: string, path: string, query: string, body: string, headers: string) -> THttp* {
+  if (g_t_arena == 0) { g_t_arena = rz_arena_new(); }
+  var h: THttp* = (THttp*)calloc(1, sizeof(THttp));
+  h->arena = rz_arena_new();
+  rz_request_init(&h->req, h->arena);
+  h->req.verb = verb;
+  h->req.path = path;
+  h->req.target = path;
+  h->req.query = query;
+  h->req.body = body;
+  h->req.body_len = (int64)body.length;
+  var lines: RzStrList* = rz_str_split(headers, 10);
+  for i in 0..lines->len {
+    var line: string = rz_strlist_get(lines, (int64)i);
+    var c: int64 = rz_str_find_byte(line, 58);
+    if (c <= 0) { continue; }
+    var k: int32 = h->req.header_count;
+    h->req.headers[k].name = rz_str_trim(rz_str_sub(line, 0, c));
+    h->req.headers[k].value = rz_str_trim(rz_str_from(line, c + 1));
+    h->req.header_count = k + 1;
+  }
+  rz_strlist_free(lines);
+  h->resp = rz_response_new();
+  rz_ctx_init(&h->ctx, &h->req, h->resp, h->arena);
+  return h;
+}
+
+export fn t_body(h: THttp*) -> string { return rz_buf_str(h->resp->body); }
+export fn t_status(h: THttp*) -> int64 { return (int64)h->resp->status; }
+export fn t_hdr(h: THttp*, name: string) -> string { return rz_resp_header_get(h->resp, name); }

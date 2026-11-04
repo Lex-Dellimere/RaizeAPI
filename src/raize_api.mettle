@@ -9,3 +9,8 @@ import "types/type";
 import "types/format";
 import "types/decode";
 import "types/encode";
+import "route/api";
+import "route/request";
+import "route/respond";
+import "openapi/openapi";
+import "route/dispatch";
