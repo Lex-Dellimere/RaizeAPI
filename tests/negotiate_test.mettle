@@ -1,0 +1,573 @@
+// Content negotiation (Accept, Accept-Encoding, 406) and compression of bodies.
+import "std/mem";
+import "raize_api/raize_api";
+import "raize_api/types/model";
+import "raize_api/negotiate/negotiate";
+import "press/press";
+import "tutil";
+import "http";
+
+@rapi_model struct NewTask {
+  title: string;
+  prio: int32;
+}
+
+@rapi_model struct Task {
+  id: int64;
+  title: string;
+  prio: int32;
+}
+
+// A JSON text of about 6 KB that compresses well.
+fn big_text() -> string {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, "{{\"items\":[");
+  for i in 0..200 {
+    rz_buf_add(b, "\"hello world, hello compression\",");
+  }
+  rz_buf_add(b, "0]}");
+  return rz_buf_take(b);
+}
+
+// About 1.2 KB that does not compress (bytes from a small generator).
+fn noise_text() -> string {
+  var b: RzBuf* = rz_buf_new();
+  var x: uint32 = 2463534242;
+  for i in 0..1200 {
+    x = x ^ (x << 13);
+    x = x ^ (x >> 17);
+    x = x ^ (x << 5);
+    rz_buf_add_byte(b, (int32)(x & 255));
+  }
+  return rz_buf_take(b);
+}
+
+fn h_big(r: RapiReq*) -> int32 {
+  var t: string = big_text();
+  var st: int32 = rapi_json_text(r, 200, t);
+  rz_str_free(t);
+  return st;
+}
+
+fn h_small(r: RapiReq*) -> int32 { return rapi_json_text(r, 200, "{{\"ok\":true}"); }
+
+fn h_noise(r: RapiReq*) -> int32 {
+  var t: string = noise_text();
+  var st: int32 = rapi_json_text(r, 200, t);
+  rz_str_free(t);
+  return st;
+}
+
+fn h_tagged(r: RapiReq*) -> int32 {
+  rapi_set_header(r, "ETag", "\"v1\"");
+  return h_big(r);
+}
+
+fn h_weak(r: RapiReq*) -> int32 {
+  rapi_set_header(r, "ETag", "W/\"v2\"");
+  return h_big(r);
+}
+
+fn h_notransform(r: RapiReq*) -> int32 {
+  rapi_set_header(r, "Cache-Control", "public, no-transform");
+  return h_big(r);
+}
+
+fn h_pre(r: RapiReq*) -> int32 {
+  rapi_set_header(r, "Content-Encoding", "br");
+  return h_big(r);
+}
+
+fn h_empty(r: RapiReq*) -> int32 { return rapi_no_content(r); }
+
+fn h_csv(r: RapiReq*) -> int32 { return rz_ctx_bytes(r->ctx, 200, "text/csv", "a,b\n1,2\n"); }
+
+fn h_task(r: RapiReq*) -> int32 {
+  var t: Task;
+  t.id = 1;
+  t.title = "x";
+  t.prio = 1;
+  return rapi_json(r, 200, Task_rapi(), (rawptr)&t);
+}
+
+fn h_create(r: RapiReq*) -> int32 {
+  var in: NewTask* = (NewTask*)rapi_body_of(r);
+  var t: Task;
+  t.id = 7;
+  t.title = in->title;
+  t.prio = in->prio;
+  return rapi_created(r, "/api/v1/tasks/7", Task_rapi(), (rawptr)&t);
+}
+
+fn build() -> RapiApi* {
+  var api: RapiApi* = rapi_new((RzApp*)0, "/api", "T", "1");
+  rapi_group(api, "/v1");
+  rapi_get(api, "/big", &h_big);
+  rapi_get(api, "/small", &h_small);
+  rapi_get(api, "/noise", &h_noise);
+  rapi_get(api, "/tagged", &h_tagged);
+  rapi_get(api, "/weak", &h_weak);
+  rapi_get(api, "/notransform", &h_notransform);
+  rapi_get(api, "/pre", &h_pre);
+  rapi_get(api, "/empty", &h_empty);
+  var op: RapiOp* = rapi_get(api, "/csv", &h_csv);
+  rapi_returns(op, 200, Task_rapi(), "csv");
+  op->resps[0].media = "text/csv";
+  op = rapi_get(api, "/task", &h_task);
+  rapi_returns(op, 200, Task_rapi(), "A task");
+  op = rapi_post(api, "/tasks", &h_create);
+  rapi_body(op, NewTask_rapi());
+  rapi_returns(op, 201, Task_rapi(), "Created");
+  op = rapi_post(api, "/small-tasks", &h_create);
+  rapi_body(op, NewTask_rapi());
+  rapi_op_max_body(op, 100);
+  rapi_group_end(api);
+  rapi_use_negotiation(api);
+  rapi_use_compression(api, 1024);
+  return api;
+}
+
+fn get(api: RapiApi*, path: string, headers: string) -> THttp* {
+  var h: THttp* = t_req("GET", path, "", "", headers);
+  rapi_handle(api, &h->ctx);
+  return h;
+}
+
+// The response body as bytes.
+fn body_of(h: THttp*) -> string { return t_body(h); }
+
+// True when the response body decodes with `coding` back to `want`.
+fn round_trip(h: THttp*, coding: string, want: string) -> bool {
+  var b: string = body_of(h);
+  var out: PressBuf;
+  press_buf_limit(&out, 1 << 20);
+  var rc: int32 = PRESS_E_ARG;
+  if (coding == "gzip") { rc = press_gzip_decompress(b.chars, (int64)b.length, &out); }
+  if (coding == "zstd") { rc = press_zstd_decompress(b.chars, (int64)b.length, &out); }
+  var same: bool = false;
+  if (rc == PRESS_OK) { same = rz_str_eq(rz_str_view(out.data, out.len), want); }
+  press_buf_free(&out);
+  return same;
+}
+
+// Request headers for a JSON body with the given Content-Encoding (built by hand so the
+// newline is certain).
+fn enc_headers(coding: string) -> string {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, "Content-Type: application/json");
+  rz_buf_add_byte(b, 10);
+  rz_buf_add(b, "Content-Encoding: ");
+  rz_buf_add(b, coding);
+  return rz_buf_take(b);
+}
+
+// A POST /v1/tasks (or other path) with a body, compressed by `coding`.
+fn post_packed(api: RapiApi*, path: string, coding: string, json: string) -> THttp* {
+  var out: PressBuf;
+  var rc: int32 = PRESS_OK;
+  var n: int64 = (int64)json.length;
+  var first: string = coding;
+  var second: string = "";
+  if (coding == "gzip, zstd") { first = "gzip"; second = "zstd"; }
+  if (first == "gzip" || first == "x-gzip") { rc = press_gzip_compress(json.chars, n, 6, &out); }
+  if (first == "zstd") { rc = press_zstd_compress(json.chars, n, 3, &out); }
+  if (first == "deflate") { rc = press_zlib_compress(json.chars, n, 6, &out); }
+  if (first == "raw") { rc = press_deflate_compress(json.chars, n, 6, &out); }
+  t_eq("compress {coding}", rc, PRESS_OK);
+  if (second == "zstd") {
+    var out2: PressBuf;
+    t_eq("compress stacked", press_zstd_compress(out.data, out.len, 3, &out2), PRESS_OK);
+    press_buf_free(&out);
+    out = out2;
+  }
+  var header: string = coding;
+  if (coding == "raw") { header = "deflate"; }
+  var hdrs: string = enc_headers(header);
+  var h: THttp* = t_req("POST", path, "", rz_str_view(out.data, out.len), hdrs);
+  rapi_handle(api, &h->ctx);
+  rz_str_free(hdrs);
+  press_buf_free(&out);
+  return h;
+}
+
+fn post_raw(api: RapiApi*, coding: string, data: string) -> THttp* {
+  var hdrs: string = enc_headers(coding);
+  var h: THttp* = t_req("POST", "/api/v1/tasks", "", data, hdrs);
+  rapi_handle(api, &h->ctx);
+  rz_str_free(hdrs);
+  return h;
+}
+
+fn test_accept_q() {
+  var j: string = "application/json";
+  t_eq("empty", rapi_accept_q("", j), 1000);
+  t_eq("blank", rapi_accept_q("   ", j), 1000);
+  t_eq("any", rapi_accept_q("*/*", j), 1000);
+  t_eq("star alone", rapi_accept_q("*", j), 1000);
+  t_eq("exact", rapi_accept_q("application/json", j), 1000);
+  t_eq("case", rapi_accept_q("APPLICATION/Json", j), 1000);
+  t_eq("type wildcard q", rapi_accept_q("application/*;q=0.5", j), 500);
+  t_eq("other type", rapi_accept_q("text/html", j), 0);
+  t_eq("other subtype", rapi_accept_q("application/xml", j), 0);
+  t_eq("pick the match", rapi_accept_q("text/html, application/json;q=0.8", j), 800);
+  t_eq("q zero", rapi_accept_q("application/json;q=0", j), 0);
+  t_eq("q 0.000", rapi_accept_q("application/json;q=0.000", j), 0);
+  t_eq("q zero dot", rapi_accept_q("application/json;q=0.", j), 0);
+  t_eq("specific beats wildcard", rapi_accept_q("application/json;q=0, */*;q=0.1", j), 0);
+  t_eq("specific beats wildcard 2", rapi_accept_q("*/*;q=0.1, application/json;q=0.9", j), 900);
+  t_eq("subtype beats type wildcard", rapi_accept_q("*/*;q=0.1, application/*;q=0.5", j), 500);
+  t_eq("order does not matter", rapi_accept_q("application/json;q=0.2, */*", j), 200);
+  t_eq("duplicate takes best", rapi_accept_q("application/json, application/json;q=0.2", j), 1000);
+  t_eq("no suffix match", rapi_accept_q("application/vnd.api+json", j), 0);
+  t_eq("suffix type exact", rapi_accept_q("application/problem+json", "application/problem+json"), 1000);
+
+  // Quality values (RFC 9110 section 12.4.2).
+  t_eq("q 1", rapi_accept_q("application/json;q=1", j), 1000);
+  t_eq("q 1.000", rapi_accept_q("application/json;q=1.000", j), 1000);
+  t_eq("q 1.0", rapi_accept_q("text/html, application/json;q=1.0", j), 1000);
+  t_eq("q 0.5", rapi_accept_q("application/json;q=0.5", j), 500);
+  t_eq("q 0.05", rapi_accept_q("application/json;q=0.05", j), 50);
+  t_eq("q 0.123", rapi_accept_q("application/json;q=0.123", j), 123);
+  t_eq("q 0.001", rapi_accept_q("application/json;q=0.001", j), 1);
+  t_eq("q upper case name", rapi_accept_q("application/json;Q=0.7", j), 700);
+  t_eq("q space around", rapi_accept_q("application/json ; q=0.3", j), 300);
+  t_eq("q after parameter", rapi_accept_q("application/json;charset=utf-8;q=0.4", "application/json;charset=utf-8"), 400);
+  t_eq("accept-ext ignored", rapi_accept_q("application/json;q=0.5;ext=1", j), 500);
+
+  // Bad syntax: the element is skipped; with nothing else usable the header counts as absent.
+  t_eq("q 0.0001 skipped", rapi_accept_q("text/html, application/json;q=0.0001", j), 0);
+  t_eq("q 0.0001 alone", rapi_accept_q("application/json;q=0.0001", j), 1000);
+  t_eq("q 1.5 skipped", rapi_accept_q("text/html, application/json;q=1.5", j), 0);
+  t_eq("q 1.001 skipped", rapi_accept_q("text/html, application/json;q=1.001", j), 0);
+  t_eq("q 2 skipped", rapi_accept_q("text/html, application/json;q=2", j), 0);
+  t_eq("q .5 skipped", rapi_accept_q("text/html, application/json;q=.5", j), 0);
+  t_eq("q -1 skipped", rapi_accept_q("text/html, application/json;q=-1", j), 0);
+  t_eq("q empty skipped", rapi_accept_q("text/html, application/json;q=", j), 0);
+  t_eq("q text skipped", rapi_accept_q("text/html, application/json;q=high", j), 0);
+  t_eq("q 0.5x skipped", rapi_accept_q("text/html, application/json;q=0.5x", j), 0);
+  t_eq("no slash", rapi_accept_q("application, application/json;q=0.5", j), 500);
+  t_eq("only garbage", rapi_accept_q("garbage", j), 1000);
+  t_eq("only commas", rapi_accept_q(",,,", j), 1000);
+  t_eq("star slash name", rapi_accept_q("text/html, */json", j), 0);
+  t_eq("empty parts", rapi_accept_q(",, application/json;q=0.4 ,,", j), 400);
+
+  // Whitespace.
+  t_eq("tabs and spaces", rapi_accept_q("\t text/html ,\t application/json \t;\t q=0.3 \t", j), 300);
+  t_eq("q spaces around equals", rapi_accept_q("application/json;q = 0.3", j), 300);
+
+  // Parameters.
+  var jc: string = "application/json;charset=utf-8";
+  t_eq("param range vs plain media", rapi_accept_q("application/json;charset=utf-8;q=0.3, application/json;q=0.9", j), 900);
+  t_eq("param range vs param media", rapi_accept_q("application/json;charset=utf-8;q=0.3, application/json;q=0.9", jc), 300);
+  t_eq("param case", rapi_accept_q("application/json;CHARSET=UTF-8;q=0.3", jc), 300);
+  t_eq("param mismatch", rapi_accept_q("application/json;charset=latin1", jc), 0);
+  t_eq("param quoted", rapi_accept_q("application/json;charset=\"utf-8\";q=0.6", jc), 600);
+  t_eq("quoted comma", rapi_accept_q("text/html;x=\"a,b\", application/json;q=0.2", j), 200);
+  t_eq("unterminated quote", rapi_accept_q("text/html;x=\"abc, application/json", j), 0);
+  t_eq("param without value", rapi_accept_q("text/html, application/json;charset", j), 0);
+
+  // The media argument itself.
+  t_eq("bad media", rapi_accept_q("*/*", "json"), 0);
+  t_eq("empty media", rapi_accept_q("*/*", ""), 0);
+}
+
+fn test_encoding_q() {
+  var ae: string = "gzip;q=0.5, zstd, identity;q=0, *";
+  t_eq("gzip", rapi_encoding_q(ae, "gzip"), 500);
+  t_eq("zstd", rapi_encoding_q(ae, "zstd"), 1000);
+  t_eq("identity off", rapi_encoding_q(ae, "identity"), 0);
+  t_eq("star covers br", rapi_encoding_q(ae, "br"), 1000);
+  t_eq("not listed", rapi_encoding_q("gzip", "zstd"), 0);
+  t_eq("identity default", rapi_encoding_q("gzip", "identity"), 1000);
+  t_eq("empty header", rapi_encoding_q("", "gzip"), 0);
+  t_eq("empty header identity", rapi_encoding_q("", "identity"), 1000);
+  t_eq("star zero excludes identity", rapi_encoding_q("*;q=0", "identity"), 0);
+  t_eq("star zero keeps named", rapi_encoding_q("*;q=0, gzip", "gzip"), 1000);
+  t_eq("star zero keeps identity named", rapi_encoding_q("*;q=0, identity", "identity"), 1000);
+  t_eq("star q", rapi_encoding_q("*;q=0.3", "zstd"), 300);
+  t_eq("named beats star", rapi_encoding_q("gzip;q=0, *;q=1", "gzip"), 0);
+  t_eq("x-gzip is gzip", rapi_encoding_q("x-gzip", "gzip"), 1000);
+  t_eq("gzip is x-gzip", rapi_encoding_q("gzip;q=0.4", "x-gzip"), 400);
+  t_eq("case", rapi_encoding_q("GZIP;Q=0.2", "gzip"), 200);
+  t_eq("whitespace", rapi_encoding_q("  gzip ; q=0.7 ,\tzstd ;q=0.1  ", "gzip"), 700);
+  t_eq("q 1.000", rapi_encoding_q("gzip;q=1.000", "gzip"), 1000);
+  t_eq("q zero", rapi_encoding_q("gzip;q=0", "gzip"), 0);
+  t_eq("q 0.0001 skipped", rapi_encoding_q("gzip;q=0.0001", "gzip"), 0);
+  t_eq("q 2 skipped", rapi_encoding_q("gzip;q=2, zstd", "gzip"), 0);
+  t_eq("q bad skipped, others kept", rapi_encoding_q("gzip;q=x, zstd;q=0.5", "zstd"), 500);
+  t_eq("bad name skipped", rapi_encoding_q("g zip, gzip;q=0.2", "gzip"), 200);
+  t_eq("only commas", rapi_encoding_q(",,,", "gzip"), 0);
+  t_eq("br", rapi_encoding_q("br, gzip", "br"), 1000);
+}
+
+fn test_406(api: RapiApi*) {
+  var h: THttp* = get(api, "/api/v1/task", "");
+  t_eq("no accept", t_status(h), 200);
+  h = get(api, "/api/v1/task", "Accept: application/json");
+  t_eq("accept json", t_status(h), 200);
+  h = get(api, "/api/v1/task", "Accept: */*");
+  t_eq("accept any", t_status(h), 200);
+  h = get(api, "/api/v1/task", "Accept: application/*;q=0.1");
+  t_eq("accept type wildcard", t_status(h), 200);
+  h = get(api, "/api/v1/task", "Accept: text/html, application/json;q=0.5");
+  t_eq("accept second", t_status(h), 200);
+  h = get(api, "/api/v1/task", "Accept: application/problem+json");
+  t_eq("accept problem only", t_status(h), 200);
+  h = get(api, "/api/v1/task", "Accept: application/vnd.api+json");
+  t_eq("accept +json range", t_status(h), 200);
+  h = get(api, "/api/v1/task", "Accept: application/vnd.api+json;q=0");
+  t_eq("+json range q0", t_status(h), 406);
+
+  h = get(api, "/api/v1/task", "Accept: text/html");
+  t_eq("accept html", t_status(h), 406);
+  t_str("406 content type", t_hdr(h, "Content-Type"), "application/problem+json");
+  t_has("406 title", t_body(h), "\"title\":\"Not Acceptable\",\"status\":406");
+  t_has("406 lists json", t_body(h), "application/json, application/problem+json");
+  h = get(api, "/api/v1/task", "Accept: text/*");
+  t_eq("accept text/*", t_status(h), 406);
+  h = get(api, "/api/v1/task", "Accept: application/json;q=0");
+  t_eq("json q0", t_status(h), 406);
+  h = get(api, "/api/v1/task", "Accept: application/json;q=0, application/problem+json;q=0");
+  t_eq("both q0", t_status(h), 406);
+  h = get(api, "/api/v1/task", "Accept: */*;q=0");
+  t_eq("any q0", t_status(h), 406);
+  h = get(api, "/api/v1/task", "Accept: image/png, text/plain;q=0.9");
+  t_eq("accept other", t_status(h), 406);
+  h = get(api, "/api/v1/task", "Accept: application/json;q=0.0001, text/html");
+  t_eq("bad q is skipped", t_status(h), 406);
+
+  // An operation that sends CSV.
+  h = get(api, "/api/v1/csv", "Accept: text/csv");
+  t_eq("csv ok", t_status(h), 200);
+  h = get(api, "/api/v1/csv", "Accept: application/json");
+  t_eq("csv not json", t_status(h), 406);
+  t_has("csv lists text/csv", t_body(h), "text/csv, application/problem+json");
+  h = get(api, "/api/v1/csv", "Accept: application/vnd.api+json");
+  t_eq("csv not +json", t_status(h), 406);
+
+  // Strange headers do not crash.
+  h = get(api, "/api/v1/task", "Accept: ;;;,,,/,/*,*/,\"");
+  t_eq("garbage accept", t_status(h), 200);
+}
+
+fn test_response_compression(api: RapiApi*) {
+  var want: string = big_text();
+  var h: THttp* = get(api, "/api/v1/big", "");
+  t_eq("plain status", t_status(h), 200);
+  t_str("plain: no coding", t_hdr(h, "Content-Encoding"), "");
+  t_ok("plain body", rz_str_eq(t_body(h), want));
+
+  h = get(api, "/api/v1/big", "Accept-Encoding: gzip");
+  t_eq("gzip status", t_status(h), 200);
+  t_str("gzip coding", t_hdr(h, "Content-Encoding"), "gzip");
+  t_str("gzip vary", t_hdr(h, "Vary"), "Accept-Encoding");
+  t_ok("gzip smaller", (int64)t_body(h).length < (int64)want.length);
+  t_ok("gzip round trip", round_trip(h, "gzip", want));
+  t_str("gzip content type kept", t_hdr(h, "Content-Type"), "application/json");
+
+  h = get(api, "/api/v1/big", "Accept-Encoding: zstd");
+  t_str("zstd coding", t_hdr(h, "Content-Encoding"), "zstd");
+  t_ok("zstd round trip", round_trip(h, "zstd", want));
+
+  h = get(api, "/api/v1/big", "Accept-Encoding: gzip, zstd");
+  t_str("tie prefers zstd", t_hdr(h, "Content-Encoding"), "zstd");
+  h = get(api, "/api/v1/big", "Accept-Encoding: *");
+  t_str("star prefers zstd", t_hdr(h, "Content-Encoding"), "zstd");
+  h = get(api, "/api/v1/big", "Accept-Encoding: gzip;q=0.5, zstd;q=0.4");
+  t_str("best q gzip", t_hdr(h, "Content-Encoding"), "gzip");
+  t_ok("best q gzip round trip", round_trip(h, "gzip", want));
+  h = get(api, "/api/v1/big", "Accept-Encoding: zstd;q=0, gzip");
+  t_str("zstd refused", t_hdr(h, "Content-Encoding"), "gzip");
+  h = get(api, "/api/v1/big", "Accept-Encoding: x-gzip");
+  t_str("x-gzip accepted", t_hdr(h, "Content-Encoding"), "gzip");
+  h = get(api, "/api/v1/big", "Accept-Encoding: gzip;q=0, zstd;q=0");
+  t_str("both refused", t_hdr(h, "Content-Encoding"), "");
+  h = get(api, "/api/v1/big", "Accept-Encoding: identity");
+  t_str("identity only", t_hdr(h, "Content-Encoding"), "");
+  h = get(api, "/api/v1/big", "Accept-Encoding: br, deflate");
+  t_str("unsupported only", t_hdr(h, "Content-Encoding"), "");
+  h = get(api, "/api/v1/big", "Accept-Encoding: gzip;q=junk");
+  t_str("bad q", t_hdr(h, "Content-Encoding"), "");
+  h = get(api, "/api/v1/big", "Accept-Encoding: ");
+  t_str("empty header", t_hdr(h, "Content-Encoding"), "");
+
+  // Not compressed: small, HEAD, no body, no-transform, already encoded, no gain.
+  h = get(api, "/api/v1/small", "Accept-Encoding: gzip");
+  t_str("small", t_hdr(h, "Content-Encoding"), "");
+  h = t_req("HEAD", "/api/v1/big", "", "", "Accept-Encoding: gzip");
+  rapi_handle(api, &h->ctx);
+  t_str("head", t_hdr(h, "Content-Encoding"), "");
+  h = get(api, "/api/v1/empty", "Accept-Encoding: gzip");
+  t_eq("empty status", t_status(h), 204);
+  t_str("204", t_hdr(h, "Content-Encoding"), "");
+  h = get(api, "/api/v1/notransform", "Accept-Encoding: gzip");
+  t_str("no-transform", t_hdr(h, "Content-Encoding"), "");
+  h = get(api, "/api/v1/pre", "Accept-Encoding: gzip");
+  t_str("already encoded", t_hdr(h, "Content-Encoding"), "br");
+  t_ok("already encoded body", rz_str_eq(t_body(h), want));
+  h = get(api, "/api/v1/noise", "Accept-Encoding: gzip, zstd");
+  t_eq("noise status", t_status(h), 200);
+  t_str("no gain", t_hdr(h, "Content-Encoding"), "");
+  t_eq("noise length", (int64)t_body(h).length, 1200);
+
+  // Errors are compressed too when they are big enough; small ones are left.
+  h = get(api, "/api/v1/nothing", "Accept-Encoding: gzip");
+  t_eq("404", t_status(h), 404);
+  t_str("404 small", t_hdr(h, "Content-Encoding"), "");
+
+  // ETag: strong becomes weak, weak stays.
+  h = get(api, "/api/v1/tagged", "Accept-Encoding: gzip");
+  t_str("tagged coding", t_hdr(h, "Content-Encoding"), "gzip");
+  t_str("etag weakened", t_hdr(h, "ETag"), "W/\"v1\"");
+  h = get(api, "/api/v1/tagged", "");
+  t_str("etag kept without coding", t_hdr(h, "ETag"), "\"v1\"");
+  h = get(api, "/api/v1/weak", "Accept-Encoding: gzip");
+  t_str("weak stays", t_hdr(h, "ETag"), "W/\"v2\"");
+
+  // A lower limit for what is worth compressing.
+  rapi_use_compression(api, 10);
+  h = get(api, "/api/v1/small", "Accept-Encoding: gzip");
+  t_str("tiny but compressible: no gain", t_hdr(h, "Content-Encoding"), "");
+  rapi_use_compression(api, 1024);
+  rz_str_free(want);
+}
+
+fn test_request_compression(api: RapiApi*) {
+  var json: string = "{{\"title\":\"buy milk\",\"prio\":3}";
+  var h: THttp* = post_packed(api, "/api/v1/tasks", "gzip", json);
+  t_eq("gzip request", t_status(h), 201);
+  t_has("gzip request body", t_body(h), "\"title\":\"buy milk\",\"prio\":3");
+  h = post_packed(api, "/api/v1/tasks", "x-gzip", json);
+  t_eq("x-gzip request", t_status(h), 201);
+  h = post_packed(api, "/api/v1/tasks", "zstd", json);
+  t_eq("zstd request", t_status(h), 201);
+  t_has("zstd request body", t_body(h), "\"title\":\"buy milk\"");
+  h = post_packed(api, "/api/v1/tasks", "deflate", json);
+  t_eq("deflate request", t_status(h), 201);
+  t_has("deflate request body", t_body(h), "\"title\":\"buy milk\"");
+  h = post_packed(api, "/api/v1/tasks", "raw", json);
+  t_eq("raw deflate request", t_status(h), 201);
+  h = post_packed(api, "/api/v1/tasks", "gzip, zstd", json);
+  t_eq("stacked request", t_status(h), 201);
+  t_has("stacked request body", t_body(h), "\"title\":\"buy milk\"");
+
+  // identity and no coding leave the body alone.
+  h = post_raw(api, "identity", json);
+  t_eq("identity", t_status(h), 201);
+  h = post_raw(api, "gzip, identity", json);
+  t_eq("identity listed but data plain", t_status(h), 400);
+
+  // Unknown codings.
+  h = post_raw(api, "br", json);
+  t_eq("br", t_status(h), 415);
+  t_str("415 accept-encoding", t_hdr(h, "Accept-Encoding"), "gzip, deflate, zstd");
+  t_str("415 type", t_hdr(h, "Content-Type"), "application/problem+json");
+  t_has("415 detail", t_body(h), "br");
+  h = post_raw(api, "gzip, br", json);
+  t_eq("gzip then br", t_status(h), 415);
+  h = post_raw(api, "compress", json);
+  t_eq("compress", t_status(h), 415);
+  h = post_raw(api, "gzip, gzip, gzip, gzip, gzip", json);
+  t_eq("too many codings", t_status(h), 415);
+  h = t_req("GET", "/api/v1/task", "", "", "Content-Encoding: br");
+  t_eq("unknown coding without body", rapi_handle(api, &h->ctx), 200);
+
+  // Corrupt input never crashes: 400.
+  h = post_raw(api, "gzip", "this is not gzip at all");
+  t_eq("not gzip", t_status(h), 400);
+  t_has("not gzip detail", t_body(h), "gzip");
+  h = post_raw(api, "zstd", "this is not zstd at all");
+  t_eq("not zstd", t_status(h), 400);
+  h = post_raw(api, "deflate", "this is not deflate at all");
+  t_eq("not deflate", t_status(h), 400);
+  h = post_raw(api, "gzip", "a");
+  t_eq("one byte", t_status(h), 400);
+  var packed: PressBuf;
+  press_gzip_compress(json.chars, (int64)json.length, 6, &packed);
+  h = post_raw(api, "gzip", rz_str_view(packed.data, packed.len / 2));
+  t_eq("truncated gzip", t_status(h), 400);
+  packed.data[packed.len - 6] = packed.data[packed.len - 6] ^ 255;
+  h = post_raw(api, "gzip", rz_str_view(packed.data, packed.len));
+  t_eq("bad checksum", t_status(h), 400);
+  press_buf_free(&packed);
+  press_zstd_compress(json.chars, (int64)json.length, 3, &packed);
+  h = post_raw(api, "zstd", rz_str_view(packed.data, packed.len - 3));
+  t_eq("truncated zstd", t_status(h), 400);
+  var k: int64 = 0;
+  while (k < packed.len) {
+    packed.data[k] = packed.data[k] ^ 0x5a;
+    k = k + 3;
+  }
+  h = post_raw(api, "zstd", rz_str_view(packed.data, packed.len));
+  t_eq("damaged zstd", t_status(h), 400);
+  press_buf_free(&packed);
+  press_zlib_compress(json.chars, (int64)json.length, 6, &packed);
+  h = post_raw(api, "deflate", rz_str_view(packed.data, 5));
+  t_eq("truncated deflate", t_status(h), 400);
+  press_buf_free(&packed);
+
+  // Every cut of a valid gzip body: an answer each time, no crash.
+  press_gzip_compress(json.chars, (int64)json.length, 6, &packed);
+  var bad: int64 = 0;
+  var cut: int64 = 0;
+  while (cut < packed.len) {
+    h = post_raw(api, "gzip", rz_str_view(packed.data, cut));
+    if (t_status(h) != 400) { bad = bad + 1; }
+    cut = cut + 1;
+  }
+  t_eq("every truncation is a 400", bad, 0);
+  press_buf_free(&packed);
+
+  // Limits: the operation's limit, then the room in the request arena.
+  var big: RzBuf* = rz_buf_new();
+  rz_buf_add(big, "{{\"title\":\"");
+  rz_buf_add_repeat(big, 97, 500);
+  rz_buf_add(big, "\",\"prio\":1}");
+  h = post_packed(api, "/api/v1/small-tasks", "gzip", rz_buf_str(big));
+  t_eq("op limit", t_status(h), 413);
+  t_has("op limit detail", t_body(h), "100 bytes");
+  h = post_packed(api, "/api/v1/tasks", "gzip", rz_buf_str(big));
+  t_eq("under api limit", t_status(h), 201);
+  rz_buf_free(big);
+
+  big = rz_buf_new();
+  rz_buf_add(big, "{{\"title\":\"");
+  rz_buf_add_repeat(big, 97, 100000);
+  rz_buf_add(big, "\",\"prio\":1}");
+  h = post_packed(api, "/api/v1/tasks", "zstd", rz_buf_str(big));
+  t_eq("too big for the arena", t_status(h), 413);
+  rapi_max_body(api, 50000);
+  h = post_packed(api, "/api/v1/tasks", "zstd", rz_buf_str(big));
+  t_eq("api limit", t_status(h), 413);
+  t_has("api limit detail", t_body(h), "50000 bytes");
+  h = post_packed(api, "/api/v1/tasks", "deflate", rz_buf_str(big));
+  t_eq("api limit deflate", t_status(h), 413);
+  h = post_packed(api, "/api/v1/tasks", "gzip", rz_buf_str(big));
+  t_eq("api limit gzip", t_status(h), 413);
+  rapi_max_body(api, 1048576);
+  rz_buf_free(big);
+
+  // A big run of zeros is a typical bomb: tiny input, huge output.
+  big = rz_buf_new();
+  rz_buf_add_repeat(big, 0, 3000000);
+  packed.data = (uint8*)0;
+  packed.len = 0;
+  packed.cap = 0;
+  packed.limit = 0;
+  press_gzip_compress((uint8*)big->data, big->len, 9, &packed);
+  h = post_raw(api, "gzip", rz_str_view(packed.data, packed.len));
+  t_eq("bomb", t_status(h), 413);
+  press_buf_free(&packed);
+  rz_buf_free(big);
+}
+
+fn main() -> int32 {
+  test_accept_q();
+  test_encoding_q();
+  var api: RapiApi* = build();
+  t_str("no decl errors", rapi_error(api), "");
+  test_406(api);
+  test_response_compression(api);
+  test_request_compression(api);
+  return t_done();
+}

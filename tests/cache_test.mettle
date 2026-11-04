@@ -1,0 +1,202 @@
+// ETags, conditional GET (304), If-Match (412) and required If-Match (428).
+import "std/mem";
+import "raize_api/raize_api";
+import "raize_api/cache/cache";
+import "tutil";
+import "http";
+
+var g_calls: int32 = 0;
+
+fn get_item(r: RapiReq*) -> int32 {
+  return rapi_json_text(r, 200, "{{\"id\":\"{rapi_str(r, "id")}\"}");
+}
+
+fn get_own(r: RapiReq*) -> int32 {
+  rapi_set_header(r, "ETag", "\"v7\"");
+  return rapi_json_text(r, 200, "{{\"v\":7}");
+}
+
+fn get_empty(r: RapiReq*) -> int32 { return rapi_no_content(r); }
+
+fn get_gone(r: RapiReq*) -> int32 { return rapi_fail(r, 404, "gone"); }
+
+fn put_item(r: RapiReq*) -> int32 {
+  g_calls = g_calls + 1;
+  var rc: int32 = rapi_if_match(r, rapi_header(r, "X-Current"));
+  if (rc != RAPI_NEXT) { return rc; }
+  return rapi_json_text(r, 200, "{{\"saved\":true}");
+}
+
+fn post_item(r: RapiReq*) -> int32 { return rapi_json_text(r, 201, "{{\"made\":true}"); }
+
+fn build() -> RapiApi* {
+  var api: RapiApi* = rapi_new((RzApp*)0, "/api", "T", "1");
+  rapi_use_etags(api);
+  var op: RapiOp* = rapi_get(api, "/items/:id", &get_item);
+  rapi_cache(op, "max-age=60");
+  rapi_get(api, "/own", &get_own);
+  rapi_get(api, "/empty", &get_empty);
+  rapi_get(api, "/gone", &get_gone);
+  rapi_put(api, "/items/:id", &put_item);
+  rapi_post(api, "/items", &post_item);
+  var req: RapiOp* = rapi_put(api, "/strict/:id", &put_item);
+  rapi_require_if_match(req);
+  rapi_require_if_match(req);
+  var del: RapiOp* = rapi_delete(api, "/strict/:id", &put_item);
+  rapi_require_if_match(del);
+  rapi_require_if_match((RapiOp*)0);
+  return api;
+}
+
+fn get_with(api: RapiApi*, verb: string, path: string, headers: string) -> THttp* {
+  var h: THttp* = t_req(verb, path, "", "", headers);
+  rapi_handle(api, &h->ctx);
+  return h;
+}
+
+fn main() -> int32 {
+  // The hash: xxHash64 test vectors (seed 0), shown as the ETag.
+  var a: RzArena* = rz_arena_new();
+  t_str("etag empty", rapi_etag_of("", a), "\"ef46db3751d8e999\"");
+  t_str("etag a", rapi_etag_of("a", a), "\"d24ec4f1a98c6e5b\"");
+  t_str("etag abc", rapi_etag_of("abc", a), "\"44bc2cf5ad770999\"");
+  t_str("etag long", rapi_etag_of("Nobody inspects the spammish repetition", a), "\"fbcea83c8a378bf1\"");
+  t_str("etag 8 bytes", rapi_etag_of("abcdefgh", a), "\"3ad351775b4634b7\"");
+  t_str("etag 12 bytes", rapi_etag_of("abcdefghijkl", a), "\"4b09b7d3a233d4b3\"");
+  t_str("etag 17 bytes", rapi_etag_of("12345678901234567", a), "\"39668b0409fb9e1c\"");
+  t_str("etag 36 bytes", rapi_etag_of("abcdefghijklmnopqrstuvwxyz0123456789", a), "\"64f23ecf1609b766\"");
+  t_str("etag 100 bytes", rapi_etag_of("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", a), "\"92f0de5a88a3c094\"");
+  t_eq("etag length", (int64)rapi_etag_of("hello", a).length, 18);
+  t_ok("etag differs", rapi_etag_of("hello", a) != rapi_etag_of("hellp", a));
+  t_ok("etag same", rapi_etag_of("hello", a) == rapi_etag_of("hello", a));
+  rz_arena_free(a);
+
+  var api: RapiApi* = build();
+  t_str("no decl errors", rapi_error(api), "");
+
+  // A plain GET gets an ETag of its body.
+  var h: THttp* = get_with(api, "GET", "/api/items/5", "");
+  t_eq("get", t_status(h), 200);
+  var tag: string = rz_str_dup(t_hdr(h, "ETag"));
+  t_eq("tag length", (int64)tag.length, 18);
+  t_str("tag is the hash of the body", tag, rapi_etag_of(t_body(h), h->arena));
+  t_str("cache-control", t_hdr(h, "Cache-Control"), "max-age=60");
+  t_str("body", t_body(h), "{{\"id\":\"5\"}");
+  var h2: THttp* = get_with(api, "GET", "/api/items/6", "");
+  t_ok("other body, other tag", t_hdr(h2, "ETag") != tag);
+
+  // If-None-Match: 304 with no body and no representation headers.
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: {tag}");
+  t_eq("304", t_status(h), 304);
+  t_str("304 body", t_body(h), "");
+  t_str("304 etag", t_hdr(h, "ETag"), tag);
+  t_str("304 cache-control", t_hdr(h, "Cache-Control"), "max-age=60");
+  t_str("304 no content-type", t_hdr(h, "Content-Type"), "");
+  t_str("304 no content-length", t_hdr(h, "Content-Length"), "");
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: W/{tag}");
+  t_eq("304 weak", t_status(h), 304);
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: \"nope\", {tag} , \"x\"");
+  t_eq("304 in list", t_status(h), 304);
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: *");
+  t_eq("304 star", t_status(h), 304);
+  h = get_with(api, "HEAD", "/api/items/5", "If-None-Match: {tag}");
+  t_eq("304 head", t_status(h), 304);
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: \"nope\"");
+  t_eq("no match", t_status(h), 200);
+  t_str("no match body", t_body(h), "{{\"id\":\"5\"}");
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: {tag}\nIf-None-Match: \"other\"");
+  t_eq("two lines", t_status(h), 304);
+  h = get_with(api, "GET", "/api/items/5", "if-none-match:    {tag}   ");
+  t_eq("lower case name and spaces", t_status(h), 304);
+
+  // Bad header values match nothing and never crash.
+  var bad: string[16] = ["x", "\"", "\"abc", "W/", "W/abc", "abc\"", "\"a\" \"b\"", ",", ",,,", "*,*", "* ", "\"a\"\"b\"", "W/W/\"a\"", "\"a b\"", "\"a\",", "\"a\"x"];
+  for i in 0..16 {
+    h = get_with(api, "GET", "/api/items/5", "If-None-Match: {bad[i]}");
+    t_ok("bad list {i}", t_status(h) == 200 || t_status(h) == 304);
+  }
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: \"abc");
+  t_eq("unterminated", t_status(h), 200);
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: abc");
+  t_eq("no quotes", t_status(h), 200);
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: {tag} {tag}");
+  t_eq("missing comma", t_status(h), 200);
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: {tag}, junk");
+  t_eq("junk poisons the list", t_status(h), 200);
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: ");
+  t_eq("empty value", t_status(h), 200);
+  var longv: RzBuf* = rz_buf_new();
+  for i in 0..2000 { rz_buf_add(longv, "\"a\","); }
+  rz_buf_add(longv, tag);
+  h = get_with(api, "GET", "/api/items/5", "If-None-Match: {rz_buf_str(longv)}");
+  t_eq("long list", t_status(h), 304);
+  rz_buf_free(longv);
+
+  // A handler's own ETag is kept; other responses get none.
+  h = get_with(api, "GET", "/api/own", "");
+  t_str("own etag", t_hdr(h, "ETag"), "\"v7\"");
+  h = get_with(api, "GET", "/api/own", "If-None-Match: \"v7\"");
+  t_eq("own 304", t_status(h), 304);
+  h = get_with(api, "GET", "/api/empty", "");
+  t_eq("204", t_status(h), 204);
+  t_str("204 no etag", t_hdr(h, "ETag"), "");
+  h = get_with(api, "GET", "/api/gone", "If-None-Match: *");
+  t_eq("404 stays", t_status(h), 404);
+  t_str("404 no etag", t_hdr(h, "ETag"), "");
+  h = get_with(api, "POST", "/api/items", "If-None-Match: *");
+  t_eq("post untouched", t_status(h), 201);
+  t_str("post no etag", t_hdr(h, "ETag"), "");
+  h = get_with(api, "GET", "/api/items/5", "If-Match: \"nope\"");
+  t_eq("get if-match fails", t_status(h), 412);
+  h = get_with(api, "GET", "/api/items/5", "If-Match: {tag}");
+  t_eq("get if-match ok", t_status(h), 200);
+
+  // If-Match for PUT (strong comparison).
+  h = get_with(api, "PUT", "/api/items/5", "");
+  t_eq("put without if-match", t_status(h), 200);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: \"v1\"\nX-Current: \"v1\"");
+  t_eq("put match", t_status(h), 200);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: \"v0\"\nX-Current: \"v1\"");
+  t_eq("put mismatch", t_status(h), 412);
+  t_has("412 problem", t_body(h), "\"title\":\"Precondition Failed\",\"status\":412");
+  t_str("412 type", t_hdr(h, "Content-Type"), "application/problem+json");
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: W/\"v1\"\nX-Current: \"v1\"");
+  t_eq("weak if-match", t_status(h), 412);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: \"v1\"\nX-Current: W/\"v1\"");
+  t_eq("weak current", t_status(h), 412);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: *\nX-Current: \"v1\"");
+  t_eq("star with resource", t_status(h), 200);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: *");
+  t_eq("star without resource", t_status(h), 412);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: \"v1\"");
+  t_eq("tag without resource", t_status(h), 412);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: \"a\", \"v1\"\nX-Current: \"v1\"");
+  t_eq("list", t_status(h), 200);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: \"v1\"\nIf-Match: \"v2\"\nX-Current: \"v2\"");
+  t_eq("two lines", t_status(h), 200);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: v1\nX-Current: \"v1\"");
+  t_eq("malformed", t_status(h), 412);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: \"v1\"\nX-Current: v1");
+  t_eq("malformed current", t_status(h), 412);
+  h = get_with(api, "PUT", "/api/items/5", "If-Match: \nX-Current: \"v1\"");
+  t_eq("empty if-match", t_status(h), 412);
+
+  // Required If-Match: 428 before the handler runs.
+  g_calls = 0;
+  h = get_with(api, "PUT", "/api/strict/5", "X-Current: \"v1\"");
+  t_eq("428", t_status(h), 428);
+  t_has("428 problem", t_body(h), "\"title\":\"Precondition Required\",\"status\":428");
+  t_eq("handler not called", g_calls, 0);
+  h = get_with(api, "DELETE", "/api/strict/5", "");
+  t_eq("428 delete", t_status(h), 428);
+  h = get_with(api, "PUT", "/api/strict/5", "If-Match: \"v1\"\nX-Current: \"v1\"");
+  t_eq("strict ok", t_status(h), 200);
+  t_eq("handler called", g_calls, 1);
+  h = get_with(api, "PUT", "/api/strict/5", "If-Match: \"v2\"\nX-Current: \"v1\"");
+  t_eq("strict 412", t_status(h), 412);
+  h = get_with(api, "PUT", "/api/items/5", "");
+  t_eq("others unaffected", t_status(h), 200);
+  h = get_with(api, "GET", "/api/openapi.json", "");
+  t_has("documented", t_body(h), "\"name\":\"If-Match\",\"in\":\"header\",\"required\":true");
+  return t_done();
+}

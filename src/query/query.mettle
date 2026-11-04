@@ -383,12 +383,11 @@ export fn rapi_query_parse(r: RapiReq*, q: RapiQuery*) -> int32 {
       q->has_after = true;
     }
   }
-  var qs: string = r->ctx->req->query;
-  var nq: int32 = rz_query_count(qs);
+  var pairs: RapiPair* = (RapiPair*)0;
+  var nq: int32 = rapi_query_pairs(r, &pairs);
   for i in 0..nq {
-    var name: string = "";
-    var value: string = "";
-    if (!rz_query_at(qs, (int32)i, r->ctx->arena, &name, &value)) { continue; }
+    var name: string = pairs[i].name;
+    var value: string = pairs[i].value;
     if (rz_str_starts(name, "filter")) {
       if (l->filterable == 0) { rapi__bad(r, name, "this list has no filters"); continue; }
       rapi__parse_filter(r, q, l, name, value);

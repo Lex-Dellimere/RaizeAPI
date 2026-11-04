@@ -1,0 +1,311 @@
+// Bearer tokens, API keys, scopes, policies and the OpenAPI security scheme.
+import "std/mem";
+import "raize_api/raize_api";
+import "raize_api/auth/auth";
+import "tutil";
+import "http";
+
+var g_user: int32 = 7;
+var g_calls: int32 = 0;
+
+fn authz(tok: string) -> string { return "Authorization: {tok}"; }
+
+fn go(api: RapiApi*, path: string, hdrs: string) -> THttp* {
+  var h: THttp* = t_req("GET", path, "", "", hdrs);
+  rapi_handle(api, &h->ctx);
+  return h;
+}
+
+// Tokens: good-token (alice: read write), admin-token (root: read write admin),
+// none-token (bob: no scopes), mal-token (mallory: read), Zm9v+/= (alice).
+fn verify(r: RapiReq*, token: string) -> bool {
+  g_calls = g_calls + 1;
+  if (token == "good-token" || token == "Zm9v+/=") {
+    r->subject = "alice"; r->scopes = "read write"; r->principal = (rawptr)&g_user; return true;
+  }
+  if (token == "admin-token") { r->subject = "root"; r->scopes = "read write admin"; return true; }
+  if (token == "none-token") { r->subject = "bob"; r->scopes = ""; return true; }
+  if (token == "mal-token") { r->subject = "mallory"; r->scopes = "read"; return true; }
+  if (token == "half-token") {
+    // A verifier that sets things and then says no must not leak them.
+    r->subject = "half"; r->scopes = "admin"; return false;
+  }
+  return false;
+}
+
+fn verify_key(r: RapiReq*, key: string) -> bool {
+  if (key == "secret-1") { r->subject = "svc"; r->scopes = "read"; return true; }
+  return false;
+}
+
+fn who(r: RapiReq*) -> int32 {
+  var p: int32 = 0;
+  if (r->principal != 0) { p = 1; }
+  return rapi_json_text(r, 200, rz_arena_str(r->ctx->arena, "{{\"sub\":\"{r->subject}\",\"principal\":{p}}"));
+}
+
+fn scopes(r: RapiReq*) -> int32 {
+  var b: RzBuf* = rz_buf_new();
+  if (rapi_has_scope(r, "read")) { rz_buf_add(b, "R"); }
+  if (rapi_has_scope(r, "write")) { rz_buf_add(b, "W"); }
+  if (rapi_has_scope(r, "admin")) { rz_buf_add(b, "A"); }
+  if (rapi_has_scope(r, "")) { rz_buf_add(b, "E"); }
+  if (rapi_has_scope(r, "read write")) { rz_buf_add(b, "B"); }
+  if (rapi_has_scope(r, "read  nothing")) { rz_buf_add(b, "X"); }
+  if (rapi_has_scope(r, "rea")) { rz_buf_add(b, "Y"); }
+  var st: int32 = rapi_json_text(r, 200, rz_arena_str(r->ctx->arena, "\"{rz_buf_str(b)}\""));
+  rz_buf_free(b);
+  return st;
+}
+
+fn not_mallory(r: RapiReq*) -> bool { return r->subject != "mallory"; }
+fn has_ok_header(r: RapiReq*) -> bool { return rz_ctx_header(r->ctx, "X-Ok").length > 0; }
+fn is_known(r: RapiReq*) -> bool { return r->subject.length > 0; }
+fn never(r: RapiReq*) -> bool { return false; }
+
+fn build() -> RapiApi* {
+  var api: RapiApi* = rapi_new((RzApp*)0, "/api", "Tasks", "1");
+  rapi_use_bearer(api, "tasks", &verify);
+  rapi_get(api, "/public", &who);
+  var op: RapiOp* = rapi_get(api, "/me", &who);
+  rapi_secure(op, "");
+  op = rapi_get(api, "/read", &scopes);
+  rapi_secure(op, "read");
+  op = rapi_get(api, "/write", &who);
+  rapi_secure(op, "read write");
+  op = rapi_get(api, "/admin", &who);
+  rapi_secure(op, "admin");
+  op = rapi_get(api, "/policy", &who);
+  rapi_secure(op, "");
+  rapi_policy(op, &not_mallory, "mallory is blocked");
+  rapi_policy(op, &has_ok_header, "send X-Ok");
+  op = rapi_get(api, "/pubpolicy", &who);
+  rapi_policy(op, &is_known, "sign in first");
+  op = rapi_get(api, "/never", &who);
+  rapi_secure(op, "");
+  rapi_policy(op, &never, "never allowed");
+  return api;
+}
+
+fn main() -> int32 {
+  var api: RapiApi* = build();
+  t_str("no decl errors", rapi_error(api), "");
+  var h: THttp*;
+
+  // The header syntax.
+  var tok: string = "";
+  t_eq("syntax ok", rapi_bearer_token("Bearer abc-._~+/=", &tok), 1);
+  t_str("syntax token", tok, "abc-._~+/=");
+  t_eq("syntax padding", rapi_bearer_token("Bearer abc==", &tok), 1);
+  t_eq("syntax lower case", rapi_bearer_token("bearer abc", &tok), 1);
+  t_eq("syntax spaces", rapi_bearer_token("Bearer    abc", &tok), 1);
+  t_str("syntax spaces token", tok, "abc");
+  t_eq("syntax empty", rapi_bearer_token("", &tok), 0);
+  t_eq("syntax basic", rapi_bearer_token("Basic dXNlcjpwYXNz", &tok), 0);
+  t_eq("syntax no space", rapi_bearer_token("Bearerabc", &tok), 0);
+  t_eq("syntax only scheme", rapi_bearer_token("Bearer", &tok), 2);
+  t_eq("syntax scheme and spaces", rapi_bearer_token("Bearer  ", &tok), 2);
+  t_eq("syntax inner space", rapi_bearer_token("Bearer a b", &tok), 2);
+  t_eq("syntax quote", rapi_bearer_token("Bearer \"abc\"", &tok), 2);
+  t_eq("syntax equals first", rapi_bearer_token("Bearer =abc", &tok), 2);
+  t_eq("syntax equals middle", rapi_bearer_token("Bearer ab=c", &tok), 2);
+  t_eq("syntax only equals", rapi_bearer_token("Bearer ===", &tok), 2);
+  t_eq("syntax non ascii", rapi_bearer_token("Bearer café", &tok), 2);
+  t_eq("syntax comma", rapi_bearer_token("Bearer a,b", &tok), 2);
+  var long_tok: RzBuf* = rz_buf_new();
+  rz_buf_add(long_tok, "Bearer ");
+  rz_buf_add_repeat(long_tok, 97, 4096);
+  t_eq("syntax longest", rapi_bearer_token(rz_buf_str(long_tok), &tok), 1);
+  rz_buf_add_byte(long_tok, 97);
+  t_eq("syntax too long", rapi_bearer_token(rz_buf_str(long_tok), &tok), 2);
+
+  // No token on a secured operation: 401 with a plain challenge.
+  g_calls = 0;
+  h = go(api, "/api/me", "");
+  t_eq("no token", t_status(h), 401);
+  t_str("no token challenge", t_hdr(h, "WWW-Authenticate"), "Bearer realm=\"tasks\"");
+  t_str("no token content type", t_hdr(h, "Content-Type"), "application/problem+json");
+  t_has("no token body", t_body(h), "\"title\":\"Unauthorized\",\"status\":401");
+  t_eq("verify not called", g_calls, 0);
+
+  // A bad token: invalid_token.
+  h = go(api, "/api/me", authz("Bearer nope"));
+  t_eq("bad token", t_status(h), 401);
+  t_str("bad token challenge", t_hdr(h, "WWW-Authenticate"),
+    "Bearer realm=\"tasks\", error=\"invalid_token\", error_description=\"the access token is not valid\"");
+  t_eq("verify called", g_calls, 1);
+  h = go(api, "/api/me", authz("Bearer half-token"));
+  t_eq("verifier that says no", t_status(h), 401);
+
+  // A good token.
+  h = go(api, "/api/me", authz("Bearer good-token"));
+  t_eq("good token", t_status(h), 200);
+  t_str("good token body", t_body(h), "{{\"sub\":\"alice\",\"principal\":1}");
+  t_str("good token no challenge", t_hdr(h, "WWW-Authenticate"), "");
+  h = go(api, "/api/me", authz("Bearer Zm9v+/="));
+  t_eq("padded token", t_status(h), 200);
+
+  // The scheme name is case-insensitive; spaces may repeat.
+  h = go(api, "/api/me", authz("bearer good-token"));
+  t_eq("lower case scheme", t_status(h), 200);
+  h = go(api, "/api/me", authz("BEARER good-token"));
+  t_eq("upper case scheme", t_status(h), 200);
+  h = go(api, "/api/me", authz("BeArEr   good-token"));
+  t_eq("mixed case scheme and spaces", t_status(h), 200);
+
+  // Other schemes are not ours.
+  h = go(api, "/api/me", authz("Basic dXNlcjpwYXNz"));
+  t_eq("basic on secured", t_status(h), 401);
+  t_str("basic challenge", t_hdr(h, "WWW-Authenticate"), "Bearer realm=\"tasks\"");
+  h = go(api, "/api/public", authz("Basic dXNlcjpwYXNz"));
+  t_eq("basic on public", t_status(h), 200);
+  t_str("basic is anonymous", t_body(h), "{{\"sub\":\"\",\"principal\":0}");
+  h = go(api, "/api/me", authz("Bearergood-token"));
+  t_eq("no space after scheme", t_status(h), 401);
+
+  // Malformed values: 401 invalid_token, never a crash, on public operations too.
+  var bad: string[10] = ["Bearer", "Bearer ", "Bearer a b", "Bearer \"good-token\"", "Bearer =x", "Bearer x=y",
+    "Bearer ===", "Bearer café", "Bearer a,b", "Bearer good-token;"];
+  for i in 0..10 {
+    h = go(api, "/api/me", authz(bad[i]));
+    t_eq("malformed {i} secured", t_status(h), 401);
+    t_has("malformed {i} challenge", t_hdr(h, "WWW-Authenticate"), "error=\"invalid_token\"");
+    h = go(api, "/api/public", authz(bad[i]));
+    t_eq("malformed {i} public", t_status(h), 401);
+  }
+  h = go(api, "/api/me", "Authorization: Bearer good-token\nAuthorization: Bearer good-token");
+  t_eq("two headers", t_status(h), 401);
+  h = go(api, "/api/me", authz(rz_buf_str(long_tok)));
+  t_eq("huge token", t_status(h), 401);
+  rz_buf_free(long_tok);
+
+  // Public operations.
+  h = go(api, "/api/public", "");
+  t_eq("public anonymous", t_status(h), 200);
+  t_str("public anonymous body", t_body(h), "{{\"sub\":\"\",\"principal\":0}");
+  h = go(api, "/api/public", authz("Bearer good-token"));
+  t_str("public sees the caller", t_body(h), "{{\"sub\":\"alice\",\"principal\":1}");
+  h = go(api, "/api/public", authz("Bearer nope"));
+  t_eq("public with a bad token", t_status(h), 401);
+
+  // Scopes.
+  h = go(api, "/api/read", authz("Bearer good-token"));
+  t_eq("scope held", t_status(h), 200);
+  t_str("has_scope", t_body(h), "\"RWEB\"");
+  h = go(api, "/api/read", authz("Bearer admin-token"));
+  t_str("has_scope admin", t_body(h), "\"RWAEB\"");
+  h = go(api, "/api/read", authz("Bearer none-token"));
+  t_eq("scope missing", t_status(h), 403);
+  t_str("scope challenge", t_hdr(h, "WWW-Authenticate"),
+    "Bearer realm=\"tasks\", error=\"insufficient_scope\", error_description=\"the token lacks a scope this operation needs\", scope=\"read\"");
+  t_str("scope content type", t_hdr(h, "Content-Type"), "application/problem+json");
+  t_has("scope body", t_body(h), "\"title\":\"Forbidden\",\"status\":403");
+  h = go(api, "/api/write", authz("Bearer good-token"));
+  t_eq("two scopes held", t_status(h), 200);
+  h = go(api, "/api/write", authz("Bearer mal-token"));
+  t_eq("one of two scopes", t_status(h), 403);
+  t_has("both scopes asked for", t_hdr(h, "WWW-Authenticate"), "scope=\"read write\"");
+  h = go(api, "/api/admin", authz("Bearer good-token"));
+  t_eq("admin without admin", t_status(h), 403);
+  h = go(api, "/api/admin", authz("Bearer admin-token"));
+  t_eq("admin with admin", t_status(h), 200);
+  h = go(api, "/api/me", authz("Bearer none-token"));
+  t_eq("any caller", t_status(h), 200);
+  h = go(api, "/api/admin", "");
+  t_eq("scoped op, no token", t_status(h), 401);
+
+  // Policies.
+  h = go(api, "/api/policy", "Authorization: Bearer good-token\nX-Ok: yes");
+  t_eq("policies pass", t_status(h), 200);
+  h = go(api, "/api/policy", authz("Bearer good-token"));
+  t_eq("second policy fails", t_status(h), 403);
+  t_has("second policy detail", t_body(h), "\"detail\":\"send X-Ok\"");
+  t_str("policy 403 has no challenge", t_hdr(h, "WWW-Authenticate"), "");
+  h = go(api, "/api/policy", "Authorization: Bearer mal-token\nX-Ok: yes");
+  t_eq("first policy fails", t_status(h), 403);
+  t_has("first policy detail", t_body(h), "\"detail\":\"mallory is blocked\"");
+  h = go(api, "/api/policy", "X-Ok: yes");
+  t_eq("policy after auth: anonymous is 401", t_status(h), 401);
+  h = go(api, "/api/pubpolicy", "");
+  t_eq("policy on a public op, anonymous", t_status(h), 403);
+  t_has("policy on a public op detail", t_body(h), "\"detail\":\"sign in first\"");
+  h = go(api, "/api/pubpolicy", authz("Bearer good-token"));
+  t_eq("policy on a public op, caller", t_status(h), 200);
+  h = go(api, "/api/never", authz("Bearer admin-token"));
+  t_eq("policy that always says no", t_status(h), 403);
+
+  // The OpenAPI document.
+  h = go(api, "/api/openapi.json", "");
+  t_eq("openapi", t_status(h), 200);
+  var doc: string = t_body(h);
+  t_has("security scheme", doc, "\"securitySchemes\":{{\"bearerAuth\":{{\"type\":\"http\",\"scheme\":\"bearer\"}}");
+  t_has("security of a scoped op", doc, "\"security\":[{{\"bearerAuth\":[\"read\"]}]");
+  t_has("security of an admin op", doc, "\"security\":[{{\"bearerAuth\":[\"admin\"]}]");
+  t_has("security with two scopes", doc, "[\"read\",\"write\"]");
+  t_has("security with no scopes", doc, "\"security\":[{{\"bearerAuth\":[]}]");
+
+  // An API key.
+  var kapi: RapiApi* = rapi_new((RzApp*)0, "/k", "Keys \"v1\"", "1");
+  rapi_use_api_key(kapi, "X-API-Key", &verify_key);
+  rapi_get(kapi, "/open", &who);
+  var kop: RapiOp* = rapi_get(kapi, "/data", &who);
+  rapi_secure(kop, "read");
+  kop = rapi_get(kapi, "/admin", &who);
+  rapi_secure(kop, "admin");
+  t_str("key api: no decl errors", rapi_error(kapi), "");
+  h = go(kapi, "/k/data", "");
+  t_eq("key missing", t_status(h), 401);
+  t_str("key challenge", t_hdr(h, "WWW-Authenticate"), "ApiKey realm=\"Keys \\\"v1\\\"\"");
+  h = go(kapi, "/k/data", "X-API-Key: secret-1");
+  t_eq("key good", t_status(h), 200);
+  t_str("key good body", t_body(h), "{{\"sub\":\"svc\",\"principal\":0}");
+  h = go(kapi, "/k/data", "x-api-key: secret-1");
+  t_eq("key header name is case-insensitive", t_status(h), 200);
+  h = go(kapi, "/k/data", "X-API-Key: wrong");
+  t_eq("key wrong", t_status(h), 401);
+  h = go(kapi, "/k/open", "X-API-Key: wrong");
+  t_eq("key wrong on public", t_status(h), 401);
+  h = go(kapi, "/k/open", "X-API-Key: secret-1");
+  t_str("key seen on public", t_body(h), "{{\"sub\":\"svc\",\"principal\":0}");
+  h = go(kapi, "/k/open", "");
+  t_eq("key public anonymous", t_status(h), 200);
+  h = go(kapi, "/k/data", "X-API-Key: secret 1");
+  t_eq("key with a space", t_status(h), 401);
+  h = go(kapi, "/k/data", "X-API-Key: ");
+  t_eq("empty key", t_status(h), 401);
+  h = go(kapi, "/k/data", "X-API-Key: secret-1\nX-API-Key: secret-1");
+  t_eq("key twice", t_status(h), 401);
+  h = go(kapi, "/k/data", "Authorization: Bearer secret-1");
+  t_eq("bearer is not an api key", t_status(h), 401);
+  h = go(kapi, "/k/admin", "X-API-Key: secret-1");
+  t_eq("key without the scope", t_status(h), 403);
+  t_str("key 403 has no challenge", t_hdr(h, "WWW-Authenticate"), "");
+  h = go(kapi, "/k/openapi.json", "");
+  t_has("key scheme", t_body(h), "\"securitySchemes\":{{\"apiKeyAuth\":{{\"type\":\"apiKey\",\"in\":\"header\",\"name\":\"X-API-Key\"}}");
+  t_has("key security", t_body(h), "\"security\":[{{\"apiKeyAuth\":[\"read\"]}]");
+
+  // Policies alone, and misuse.
+  var papi: RapiApi* = rapi_new((RzApp*)0, "/p", "Policies", "1");
+  var pop: RapiOp* = rapi_get(papi, "/x", &who);
+  rapi_policy(pop, &never, "closed");
+  h = go(papi, "/p/x", "");
+  t_eq("policy without a scheme", t_status(h), 403);
+  var sop: RapiOp* = rapi_get(papi, "/s", &who);
+  rapi_secure(sop, "");
+  h = go(papi, "/p/s", "");
+  t_eq("secured op without a scheme", t_status(h), 401);
+  rapi_use_bearer(papi, "", &verify);
+  t_str("scheme after a policy", rapi_error(papi), "");
+  h = go(papi, "/p/s", "");
+  t_str("no realm", t_hdr(h, "WWW-Authenticate"), "Bearer");
+  h = go(papi, "/p/s", authz("Bearer nope"));
+  t_str("no realm, invalid token", t_hdr(h, "WWW-Authenticate"),
+    "Bearer error=\"invalid_token\", error_description=\"the access token is not valid\"");
+  rapi_use_api_key(papi, "X-Key", &verify_key);
+  t_has("two schemes", rapi_error(papi), "twice");
+  var bapi: RapiApi* = rapi_new((RzApp*)0, "/b", "Bad", "1");
+  rapi_use_api_key(bapi, "Bad Header", &verify_key);
+  t_has("bad header name", rapi_error(bapi), "bad header name");
+  rapi_policy((RapiOp*)0, &never, "x");
+  return t_done();
+}

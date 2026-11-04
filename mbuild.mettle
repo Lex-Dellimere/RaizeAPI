@@ -19,3 +19,10 @@ fn deps() {
   mb_dep_path("press", "../press");
   mb_dep("json", "v1.0.0");
 }
+
+// fuzz: a long fuzzing run in release (`mbuild fuzz 2000000` for more rounds).
+fn cmd_fuzz(a: MbArgs*) -> int32 {
+  var n: string = "500000";
+  if (mb_nargs(a) > 0) { n = mb_arg(a, 0); }
+  return mb_sh("RAPI_FUZZ_ITERS=" + n + " \"$MBUILD_EXE\" test fuzz -r --force");
+}

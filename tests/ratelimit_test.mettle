@@ -1,0 +1,252 @@
+// Rate limiting: GCRA buckets, RateLimit headers, Retry-After, 429, eviction, threads.
+import "std/mem";
+import "std/thread";
+import "raize_api/raize_api";
+import "raize_api/ratelimit/ratelimit";
+import "tutil";
+import "http";
+
+var g_now: int64 = 1000000;      // fake clock, milliseconds
+var g_allowed: int32 = 0;
+var g_threaded: RapiApi* = 0;
+
+fn fake_clock() -> int64 { return g_now; }
+
+fn ok_handler(r: RapiReq*) -> int32 { return rapi_json_text(r, 200, "{{\"ok\":true}"); }
+
+// Stands in for an auth hook: the caller is named by X-User.
+fn user_hook(r: RapiReq*) -> int32 {
+  r->subject = rapi_header(r, "X-User");
+  return RAPI_NEXT;
+}
+
+fn key_of(r: RapiReq*) -> string { return rapi_header(r, "X-Key"); }
+
+fn call(api: RapiApi*, path: string, ip: string, headers: string) -> THttp* {
+  var h: THttp* = t_req("GET", path, "", "", headers);
+  var addr: uint32 = 0;
+  if (ip.length > 0) { rz__ipv4_parse(ip, &addr); }
+  h->ctx.peer = addr;
+  rapi_handle(api, &h->ctx);
+  return h;
+}
+
+fn advance(ms: int64) { g_now = g_now + ms; }
+
+fn worker(arg: cstring) -> uint32 {
+  for i in 0..500 {
+    var h: THttp* = call(g_threaded, "/c/x", "10.9.9.9", "");
+    if (t_status(h) == 200) { atomic_inc_i32(&g_allowed); }
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  rapi__rate_clock(&fake_clock);
+
+  // The API-wide limit: 3 per 60 seconds, so one more every 20 seconds.
+  var api: RapiApi* = rapi_new((RzApp*)0, "/a", "T", "1");
+  rapi_before(api, &user_hook);
+  rapi_use_rate_limit(api, 3, 60);
+  rapi_get(api, "/fast", &ok_handler);
+  rapi_get(api, "/other", &ok_handler);
+  var slow: RapiOp* = rapi_get(api, "/slow", &ok_handler);
+  rapi_op_rate(slow, 1, 10);
+  var free_op: RapiOp* = rapi_get(api, "/free", &ok_handler);
+  rapi_op_rate(free_op, 0, 0);
+  rapi_op_rate((RapiOp*)0, 5, 5);
+  t_str("no decl errors", rapi_error(api), "");
+
+  var h: THttp* = call(api, "/a/fast", "10.0.0.1", "");
+  t_eq("1st", t_status(h), 200);
+  t_str("policy", t_hdr(h, "RateLimit-Policy"), "\"default\";q=3;w=60");
+  t_str("limit 1", t_hdr(h, "RateLimit"), "\"default\";r=2;t=20");
+  h = call(api, "/a/other", "10.0.0.1", "");
+  t_eq("2nd", t_status(h), 200);
+  t_str("limit 2", t_hdr(h, "RateLimit"), "\"default\";r=1;t=40");
+  h = call(api, "/a/fast", "10.0.0.1", "");
+  t_eq("3rd", t_status(h), 200);
+  t_str("limit 3", t_hdr(h, "RateLimit"), "\"default\";r=0;t=60");
+  h = call(api, "/a/fast", "10.0.0.1", "");
+  t_eq("4th is refused", t_status(h), 429);
+  t_str("retry-after", t_hdr(h, "Retry-After"), "20");
+  t_str("refused limit", t_hdr(h, "RateLimit"), "\"default\";r=0;t=20");
+  t_str("refused policy", t_hdr(h, "RateLimit-Policy"), "\"default\";q=3;w=60");
+  t_str("429 type", t_hdr(h, "Content-Type"), "application/problem+json");
+  t_has("429 body type", t_body(h), "\"type\":\"https://iana.org/assignments/http-problem-types#quota-exceeded\"");
+  t_has("429 body title", t_body(h), "\"title\":\"Request cannot be satisfied as assigned quota has been exceeded\",\"status\":429");
+  t_has("429 body detail", t_body(h), "\"detail\":\"too many requests; try again in 20 seconds\"");
+  t_has("429 body policies", t_body(h), "\"violated-policies\":[\"default\"]");
+
+  // Refused requests do not push the caller further back.
+  advance(19000);
+  h = call(api, "/a/fast", "10.0.0.1", "");
+  t_eq("still refused", t_status(h), 429);
+  t_str("retry in 1", t_hdr(h, "Retry-After"), "1");
+  advance(1000);
+  h = call(api, "/a/fast", "10.0.0.1", "");
+  t_eq("one more after 20s", t_status(h), 200);
+  t_str("none left", t_hdr(h, "RateLimit"), "\"default\";r=0;t=60");
+  h = call(api, "/a/fast", "10.0.0.1", "");
+  t_eq("refused again", t_status(h), 429);
+  t_str("retry in 20", t_hdr(h, "Retry-After"), "20");
+
+  // Recovery: after a whole window the bucket is full again.
+  advance(60000);
+  h = call(api, "/a/fast", "10.0.0.1", "");
+  t_eq("recovered", t_status(h), 200);
+  t_str("full again", t_hdr(h, "RateLimit"), "\"default\";r=2;t=20");
+  advance(3600000);
+  h = call(api, "/a/fast", "10.0.0.1", "");
+  t_str("long idle is no more than full", t_hdr(h, "RateLimit"), "\"default\";r=2;t=20");
+
+  // Other callers have their own buckets.
+  h = call(api, "/a/fast", "10.0.0.2", "");
+  t_str("other ip", t_hdr(h, "RateLimit"), "\"default\";r=2;t=20");
+  h = call(api, "/a/fast", "10.0.0.2", "X-User: ann");
+  t_str("subject, not ip", t_hdr(h, "RateLimit"), "\"default\";r=2;t=20");
+  h = call(api, "/a/fast", "10.0.0.2", "X-User: ann");
+  t_str("subject again", t_hdr(h, "RateLimit"), "\"default\";r=1;t=40");
+  h = call(api, "/a/fast", "10.0.0.3", "X-User: ann");
+  t_str("subject follows the user over ips", t_hdr(h, "RateLimit"), "\"default\";r=0;t=60");
+  h = call(api, "/a/fast", "10.0.0.2", "X-User: bob");
+  t_str("other subject", t_hdr(h, "RateLimit"), "\"default\";r=2;t=20");
+  h = call(api, "/a/fast", "10.0.0.2", "X-User: 10.0.0.2");
+  t_str("a subject that looks like an ip is not the ip", t_hdr(h, "RateLimit"), "\"default\";r=2;t=20");
+  h = call(api, "/a/fast", "", "");
+  t_eq("unknown address", t_status(h), 200);
+  h = call(api, "/a/fast", "", "");
+  t_str("unknown addresses share one bucket", t_hdr(h, "RateLimit"), "\"default\";r=1;t=40");
+
+  // One operation with its own limit and its own buckets.
+  h = call(api, "/a/slow", "10.0.0.5", "");
+  t_eq("slow 1", t_status(h), 200);
+  t_str("slow policy", t_hdr(h, "RateLimit-Policy"), "\"getSlow\";q=1;w=10");
+  t_str("slow limit", t_hdr(h, "RateLimit"), "\"getSlow\";r=0;t=10");
+  h = call(api, "/a/slow", "10.0.0.5", "");
+  t_eq("slow 2", t_status(h), 429);
+  t_str("slow retry", t_hdr(h, "Retry-After"), "10");
+  t_has("slow violated", t_body(h), "\"violated-policies\":[\"getSlow\"]");
+  h = call(api, "/a/fast", "10.0.0.5", "");
+  t_str("default bucket untouched by slow", t_hdr(h, "RateLimit"), "\"default\";r=2;t=20");
+  advance(10000);
+  h = call(api, "/a/slow", "10.0.0.5", "");
+  t_eq("slow recovers", t_status(h), 200);
+
+  // An operation set to 0 is not limited, even with the API-wide limit.
+  for i in 0..10 {
+    h = call(api, "/a/free", "10.0.0.6", "");
+    t_eq("free {i}", t_status(h), 200);
+  }
+  t_str("free has no headers", t_hdr(h, "RateLimit"), "");
+  t_str("free has no policy", t_hdr(h, "RateLimit-Policy"), "");
+
+  // Not found and 405 are not counted.
+  h = call(api, "/a/missing", "10.0.0.7", "");
+  t_eq("404", t_status(h), 404);
+  t_str("404 no headers", t_hdr(h, "RateLimit"), "");
+
+  // An API with only an operation limit.
+  var api2: RapiApi* = rapi_new((RzApp*)0, "/b", "T", "1");
+  var lim: RapiOp* = rapi_get(api2, "/x", &ok_handler);
+  rapi_get(api2, "/y", &ok_handler);
+  rapi_op_rate(lim, 2, 30);
+  rapi_op_rate(lim, 2, 30);
+  h = call(api2, "/b/x", "10.0.0.1", "");
+  t_str("op only", t_hdr(h, "RateLimit"), "\"getX\";r=1;t=15");
+  h = call(api2, "/b/y", "10.0.0.1", "");
+  t_eq("y unlimited", t_status(h), 200);
+  t_str("y no headers", t_hdr(h, "RateLimit"), "");
+  h = call(api2, "/b/x", "10.0.0.1", "");
+  t_eq("x 2nd", t_status(h), 200);
+  h = call(api2, "/b/x", "10.0.0.1", "");
+  t_eq("x 3rd", t_status(h), 429);
+  t_str("x retry", t_hdr(h, "Retry-After"), "15");
+
+  // Retry-After is rounded up to whole seconds.
+  var api3: RapiApi* = rapi_new((RzApp*)0, "/r", "T", "1");
+  rapi_use_rate_limit(api3, 10, 1);
+  rapi_get(api3, "/x", &ok_handler);
+  for i in 0..10 {
+    h = call(api3, "/r/x", "10.0.0.1", "");
+    t_eq("burst {i}", t_status(h), 200);
+  }
+  h = call(api3, "/r/x", "10.0.0.1", "");
+  t_eq("11th", t_status(h), 429);
+  t_str("100 ms rounds up to 1 s", t_hdr(h, "Retry-After"), "1");
+  advance(100);
+  h = call(api3, "/r/x", "10.0.0.1", "");
+  t_eq("one every 100 ms", t_status(h), 200);
+  h = call(api3, "/r/x", "10.0.0.1", "");
+  t_eq("and not two", t_status(h), 429);
+
+  // A custom key. "" falls back to the address.
+  var api4: RapiApi* = rapi_new((RzApp*)0, "/k", "T", "1");
+  rapi_use_rate_limit(api4, 1, 100);
+  rapi_rate_key(api4, &key_of);
+  rapi_get(api4, "/x", &ok_handler);
+  h = call(api4, "/k/x", "10.0.0.1", "X-Key: one");
+  t_eq("key one", t_status(h), 200);
+  h = call(api4, "/k/x", "10.0.0.2", "X-Key: one");
+  t_eq("key one from another ip", t_status(h), 429);
+  h = call(api4, "/k/x", "10.0.0.1", "X-Key: two");
+  t_eq("key two", t_status(h), 200);
+  h = call(api4, "/k/x", "10.0.0.1", "");
+  t_eq("no key: address", t_status(h), 200);
+  h = call(api4, "/k/x", "10.0.0.1", "");
+  t_eq("no key again", t_status(h), 429);
+  h = call(api4, "/k/x", "10.0.0.1", "X-Key: i10.0.0.1");
+  t_eq("kinds do not mix", t_status(h), 200);
+
+  // Long keys: hashed whole, compared on what is kept. They differ at byte 60.
+  var a60: string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  h = call(api4, "/k/x", "10.0.0.1", "X-Key: {a60}x");
+  t_eq("long key x", t_status(h), 200);
+  h = call(api4, "/k/x", "10.0.0.1", "X-Key: {a60}y");
+  t_eq("long key y", t_status(h), 200);
+  h = call(api4, "/k/x", "10.0.0.1", "X-Key: {a60}x");
+  t_eq("long key x again", t_status(h), 429);
+  h = call(api4, "/k/x", "10.0.0.1", "X-Key: {a60}y");
+  t_eq("long key y again", t_status(h), 429);
+
+  // Eviction: 16 slots, the oldest TAT goes first.
+  var api5: RapiApi* = rapi_new((RzApp*)0, "/e", "T", "1");
+  rapi_before(api5, &user_hook);
+  rapi_use_rate_limit(api5, 2, 100000);
+  rapi_rate_table_size(api5, 16);
+  rapi_rate_table_size(api5, 3);
+  rapi_get(api5, "/x", &ok_handler);
+  rapi__rate_reset(api5);
+  for i in 0..16 {
+    h = call(api5, "/e/x", "", "X-User: k{i}");
+    t_eq("fill {i}", t_status(h), 200);
+    advance(1000);
+  }
+  h = call(api5, "/e/x", "", "X-User: newcomer");
+  t_eq("newcomer fits", t_status(h), 200);
+  advance(1000);
+  h = call(api5, "/e/x", "", "X-User: k15");
+  t_str("newest key kept its bucket", t_hdr(h, "RateLimit"), "\"default\";r=0;t=99998");
+  h = call(api5, "/e/x", "", "X-User: newcomer");
+  t_str("newcomer kept its bucket", t_hdr(h, "RateLimit"), "\"default\";r=0;t=99999");
+  h = call(api5, "/e/x", "", "X-User: k0");
+  t_str("oldest key was evicted and starts full", t_hdr(h, "RateLimit"), "\"default\";r=1;t=50000");
+  for i in 0..300 {
+    h = call(api5, "/e/x", "", "X-User: flood{i}");
+    t_eq("flood {i}", t_status(h), 200);
+    advance(10);
+  }
+
+  // Many threads share one bucket: exactly `limit` requests pass.
+  g_threaded = rapi_new((RzApp*)0, "/c", "T", "1");
+  rapi_use_rate_limit(g_threaded, 1000, 3600);
+  rapi_get(g_threaded, "/x", &ok_handler);
+  var tids: int64[4];
+  var tid: uint32 = 0;
+  for i in 0..4 { tids[i] = CreateThread(0, 0, &worker, 0, 0, &tid); }
+  for i in 0..4 { thread_join_infinite(tids[i]); thread_close(tids[i]); }
+  t_eq("threads: exactly the limit passed", (int64)g_allowed, 1000);
+
+  rapi__rate_clock_real();
+  return t_done();
+}

@@ -80,6 +80,50 @@ fn rapi__in_word(in: int32) -> string {
   return "header";
 }
 
+/// One decoded query pair.
+export struct RapiPair {
+  name: string;
+  value: string;
+}
+
+/// Every name=value pair of the request's query, percent-decoded ('+' is a space),
+/// in order, in the request arena. Returns the count; *out gets the pairs.
+export fn rapi_query_pairs(r: RapiReq*, out: RapiPair**) -> int32 {
+  var arena: RzArena* = r->ctx->arena;
+  var q: string = r->ctx->req->query;
+  var len: int64 = (int64)q.length;
+  var total: int64 = 1;
+  for i in 0..q.length {
+    if (q.chars[i] == 38) { total = total + 1; }
+  }
+  var pairs: RapiPair* = (RapiPair*)rz_arena_alloc(arena, total * (int64)sizeof(RapiPair));
+  if (pairs == 0) { *out = pairs; return 0; }
+  var n: int32 = 0;
+  var start: int64 = 0;
+  var k: int64 = 0;
+  while (k <= len) {
+    if (k == len || q.chars[k] == 38) {
+      if (k > start) {
+        var pair: string = rz_str_sub(q, start, k);
+        var eq: int64 = rz_str_find_byte(pair, 61);
+        var raw_name: string = pair;
+        var raw_value: string = "";
+        if (eq >= 0) {
+          raw_name = rz_str_sub(pair, 0, eq);
+          raw_value = rz_str_from(pair, eq + 1);
+        }
+        pairs[n].name = rz_pct_decode(raw_name, true, arena);
+        pairs[n].value = rz_pct_decode(raw_value, true, arena);
+        n = n + 1;
+      }
+      start = k + 1;
+    }
+    k = k + 1;
+  }
+  *out = pairs;
+  return n;
+}
+
 // Collects the raw texts of parameter p. Path values come from `seg`.
 fn rapi__texts(r: RapiReq*, p: RapiParam*, seg: string, out: string*, cap: int32) -> int32 {
   var arena: RzArena* = r->ctx->arena;
@@ -89,14 +133,11 @@ fn rapi__texts(r: RapiReq*, p: RapiParam*, seg: string, out: string*, cap: int32
     return 1;
   }
   if (p->in == RAPI_IN_QUERY) {
-    var q: string = r->ctx->req->query;
-    var nq: int32 = rz_query_count(q);
-    for i in 0..nq {
-      var name: string = "";
-      var value: string = "";
-      if (!rz_query_at(q, (int32)i, arena, &name, &value)) { continue; }
-      if (!rz_str_eq(name, p->name)) { continue; }
-      if (n < cap) { out[n] = value; }
+    var pairs: RapiPair* = (RapiPair*)0;
+    var np: int32 = rapi_query_pairs(r, &pairs);
+    for i in 0..np {
+      if (!rz_str_eq(pairs[i].name, p->name)) { continue; }
+      if (n < cap) { out[n] = pairs[i].value; }
       n = n + 1;
     }
     return n;

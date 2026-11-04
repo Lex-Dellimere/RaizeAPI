@@ -1,0 +1,175 @@
+// Fuzzing: random and mutated input through the decoder, the parameter parser and
+// the whole request pipeline. Nothing may crash or hang. RAPI_FUZZ_ITERS sets the
+// rounds (default 20000).
+import "std/mem";
+import "std/io";
+import "std/env";
+import "raize_api/raize_api";
+import "raize_api/types/model";
+import "raize_api/query/query";
+import "codec/core/list";
+import "tutil";
+import "http";
+
+@rapi_model struct FzTag { name: string; }
+@rapi_model struct FzBody {
+  title: string;
+  n: int32;
+  big: int64;
+  x: float64;
+  ok: bool;
+  tags: CodecList<FzTag>;
+  words: CodecList<string>;
+}
+
+var g_seed: uint64 = 88172645463325252;
+
+fn next_u64() -> uint64 {
+  g_seed = g_seed ^ (g_seed << (uint64)13);
+  g_seed = g_seed ^ (g_seed >> (uint64)7);
+  g_seed = g_seed ^ (g_seed << (uint64)17);
+  return g_seed;
+}
+
+fn below(n: int64) -> int64 { return (int64)(next_u64() % (uint64)n); }
+
+const SEEDS_N: int32 = 8;
+
+fn seed_doc(i: int64) -> string {
+  if (i == 0) { return "{{\"title\":\"abc\",\"n\":3,\"big\":-9,\"x\":1.5e3,\"ok\":true,\"tags\":[{{\"name\":\"q\"}],\"words\":[\"a\",\"\\u00e9\\ud83d\\ude00\"]}"; }
+  if (i == 1) { return "[1,2,{{\"a\":[[[]]]}]"; }
+  if (i == 2) { return "{{\"title\":null,\"tags\":[null,{{}],\"n\":9223372036854775808}"; }
+  if (i == 3) { return "\"just a string\""; }
+  if (i == 4) { return "{{\"title\":\"x\",\"title\":\"y\",\"x\":-0.0e-400}"; }
+  if (i == 5) { return "{{\"words\":[\"a\",1,true,null,{{}]}"; }
+  if (i == 6) { return "{{}"; }
+  return "{{\"tags\":[{{\"name\":\"" + "\\\\\\\"" + "\"}],\"ok\":false}";
+}
+
+// Copies s into fresh bytes with a few random edits.
+fn mutate(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  var cap: int64 = n + 16;
+  var p: uint8* = (uint8*)malloc(cap);
+  memcpy((rawptr)p, (rawptr)s.chars, n);
+  var edits: int64 = 1 + below(4);
+  for e in 0..edits {
+    var kind: int64 = below(4);
+    if (n == 0) { kind = 1; }
+    if (kind == 0) { p[below(n)] = (uint8)below(256); }
+    else if (kind == 1 && n < cap) { p[n] = (uint8)below(256); n = n + 1; }
+    else if (kind == 2 && n > 0) { n = below(n); }
+    else if (n > 0) { p[below(n)] = (uint8)(34 + below(92)); }
+  }
+  return rz_str_view(p, n);
+}
+
+fn rand_text(max: int64) -> string {
+  var n: int64 = below(max + 1);
+  var p: uint8* = (uint8*)malloc(n + 1);
+  var alphabet: string = "abc019-_.~%&=[],:;/?#{{}\"' \t\\+*!@$^()<>|";
+  for i in 0..n {
+    if (below(8) == 0) { p[i] = (uint8)below(256); }
+    else { p[i] = alphabet.chars[below((int64)alphabet.length)]; }
+  }
+  return rz_str_view(p, n);
+}
+
+fn h_any(r: RapiReq*) -> int32 { return rapi_json_text(r, 200, "{{}"); }
+
+fn h_list(r: RapiReq*) -> int32 {
+  var q: RapiQuery;
+  var st: int32 = rapi_query_parse(r, &q);
+  if (st != RAPI_NEXT) { return st; }
+  var items: FzTag[3];
+  items[0].name = "a";
+  items[1].name = "b";
+  items[2].name = "c";
+  var page: rawptr = (rawptr)0;
+  var n: int64 = 0;
+  rapi_query_apply(&q, FzTag_rapi(), (rawptr)&items[0], 3, r->ctx->arena, &page, &n);
+  return rapi_json_page(r, &q, FzTag_rapi(), page, n);
+}
+
+fn fz_verify(r: RapiReq*, token: string) -> bool {
+  if (token != "good") { return false; }
+  r->subject = "u1";
+  r->scopes = "read write";
+  return true;
+}
+
+fn hdr(name: string, value: string) -> string { return "\n" + name + ": " + value; }
+
+fn main() -> int32 {
+  var iters: int64 = 20000;
+  rapi_parse_int(env_get_or("RAPI_FUZZ_ITERS", "20000"), &iters);
+  var t: RapiType* = FzBody_rapi();
+  rapi_len(rapi_field_type(t, "title"), 1, 8);
+  rapi_range(rapi_field_type(t, "n"), 0, 10);
+  rapi_require(t, "big", false);
+  var api: RapiApi* = rapi_new((RzApp*)0, "/api", "Fuzz", "1");
+  var op: RapiOp* = rapi_post(api, "/things/:id", &h_any);
+  rapi_path_param(op, "id", rapi_range(rapi_int64_t(), 1, 100), "");
+  rapi_query(op, "q", rapi_array_t(rapi_int32_t()), false, "");
+  rapi_header_param(op, "X-Mode", rapi_enum(rapi_enum(rapi_string_t(), "a"), "b"), false, "");
+  rapi_body(op, t);
+  var lop: RapiOp* = rapi_get(api, "/list", &h_list);
+  var l: RapiListing* = rapi_listing(lop, FzTag_rapi(), 2, 5);
+  rapi_listing_sort(lop, l, "name");
+  rapi_listing_filter(lop, l, "name");
+  rapi_listing_fields(lop, l);
+  var aop: RapiOp* = rapi_get(api, "/a/:x/b/:y", &h_any);
+  rapi_secure(aop, "read");
+  rapi_idempotent(op, false);
+  rapi_require_if_match(op);
+  rapi_use_bearer(api, "fuzz", &fz_verify);
+  rapi_use_rate_limit(api, 1000000, 1);
+  rapi_use_idempotency(api, 60, 64);
+  rapi_use_etags(api);
+  rapi_use_negotiation(api);
+  rapi_use_compression(api, 16);
+  rapi_use_cors(api, "https://a.example https://b.example", true, 600);
+  var hnames: string[9] = ["Origin", "Accept", "Accept-Encoding", "Content-Encoding", "If-None-Match", "If-Match", "Authorization", "Idempotency-Key", "Access-Control-Request-Method"];
+  var hvals: string[9] = ["https://a.example", "application/json;q=0.5, */*;q=0.1", "gzip;q=1, zstd", "gzip", "W/\"abc\", \"def\"", "*", "Bearer good", "\"k1\"", "POST"];
+
+  var paths: string[5] = ["/api/things/", "/api/list", "/api/a/", "/api/", "/api/openapi.json"];
+  var verbs: string[5] = ["GET", "POST", "PATCH", "OPTIONS", "HEAD"];
+  var a: RzArena* = rz_arena_new();
+  var e: RapiErrors;
+  var ok_count: int64 = 0;
+  var from: int64 = 0;
+  rapi_parse_int(env_get_or("RAPI_FUZZ_FROM", "0"), &from);
+  var only: int64 = -1;
+  rapi_parse_int(env_get_or("RAPI_FUZZ_ONLY", "-1"), &only);
+  var trace: bool = env_get_or("RAPI_FUZZ_TRACE", "").length > 0;
+  for it in 0..iters {
+    var doc: string = mutate(seed_doc(below((int64)SEEDS_N)));
+    var out: FzBody;
+    memset((rawptr)&out, 0, sizeof(FzBody));
+    if (rapi_decode(t, doc, (rawptr)&out, a, &e, (int64*)0) == RAPI_DECODE_OK) { ok_count = ok_count + 1; }
+
+    var path: string = paths[below(5)] + rand_text(12);
+    var query: string = rand_text(24);
+    if (below(3) == 0) { query = "limit=" + rand_text(3) + "&sort=" + rand_text(6) + "&filter[name][" + rand_text(4) + "]=" + rand_text(4) + "&fields=" + rand_text(5); }
+    var hdrs: string = "Content-Type: application/json" + hdr("X-Mode", rand_text(3));
+    for hk in 0..9 {
+      var pick: int64 = below(4);
+      if (pick == 1) { hdrs = hdrs + hdr(hnames[hk], hvals[hk]); }
+      if (pick == 2) { hdrs = hdrs + hdr(hnames[hk], mutate(hvals[hk])); }
+      if (pick == 3) { hdrs = hdrs + hdr(hnames[hk], rand_text(20)); }
+    }
+    var verb: string = verbs[below(5)];
+    if (trace) { println("{it} {verb} {path} ?{query}"); }
+    var h: THttp* = t_req(verb, path, query, doc, hdrs);
+    var st: int32 = 200;
+    if ((it >= from && (only < 0 || it == only)) || rz_str_starts(path, "/api/openapi.json")) { st = rapi_handle(api, &h->ctx); }
+    t_ok("status in range", st >= 100 && st < 600);
+    rz_response_free(h->resp);
+    rz_arena_free(h->arena);
+    free((rawptr)h);
+    free((rawptr)doc.chars);
+    rz_arena_reset(a);
+  }
+  println("fuzz: {iters} rounds, {ok_count} documents decoded cleanly");
+  return t_done();
+}

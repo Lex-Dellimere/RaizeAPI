@@ -1,0 +1,405 @@
+// Idempotency-Key: replay, conflicts, expiry, eviction, scoping and bad headers.
+import "std/mem";
+import "raize_api/raize_api";
+import "raize_api/idempotency/idempotency";
+import "tutil";
+import "http";
+
+var g_api: RapiApi* = 0;
+var g_api2: RapiApi* = 0;
+var g_runs: int32 = 0;
+var g_flaky: int32 = 0;
+var g_inner: int64 = 0;
+var g_inner_retry: string = "";
+var g_now: int64 = 1000000;
+
+fn clock() -> int64 { return g_now; }
+
+fn go(api: RapiApi*, verb: string, path: string, query: string, body: string, hdrs: string) -> THttp* {
+  var h: THttp* = t_req(verb, path, query, body, hdrs);
+  rapi_handle(api, &h->ctx);
+  return h;
+}
+
+fn key(k: string) -> string { return "Idempotency-Key: \"{k}\"\nContent-Type: application/json"; }
+
+// Sets the caller from X-User, as an auth hook would.
+fn who(r: RapiReq*) -> int32 {
+  r->subject = rz_arena_str(r->ctx->arena, rz_ctx_header(r->ctx, "X-User"));
+  return RAPI_NEXT;
+}
+
+fn create(r: RapiReq*) -> int32 {
+  g_runs = g_runs + 1;
+  rapi_set_header(r, "Location", rz_arena_str(r->ctx->arena, "/orders/{g_runs}"));
+  return rapi_json_text(r, 201, rz_arena_str(r->ctx->arena, "{{\"n\":{g_runs}}"));
+}
+
+fn plain(r: RapiReq*) -> int32 {
+  g_runs = g_runs + 1;
+  return rapi_json_text(r, 200, "{{}");
+}
+
+fn nothing(r: RapiReq*) -> int32 {
+  g_runs = g_runs + 1;
+  return rapi_no_content(r);
+}
+
+fn missing(r: RapiReq*) -> int32 {
+  g_runs = g_runs + 1;
+  return rapi_fail(r, 404, "no such order");
+}
+
+// 500 the first time, then 201.
+fn flaky(r: RapiReq*) -> int32 {
+  g_flaky = g_flaky + 1;
+  if (g_flaky == 1) { return rapi_fail(r, 500, "boom"); }
+  return rapi_json_text(r, 201, "{{\"ok\":true}");
+}
+
+// While this request is in flight the same request comes in again (what a second
+// worker thread would see).
+fn slow(r: RapiReq*) -> int32 {
+  g_runs = g_runs + 1;
+  var h: THttp* = go(g_api, "POST", "/api/slow", "", "{{\"a\":1}", key("slow-1"));
+  g_inner = t_status(h);
+  g_inner_retry = t_hdr(h, "Content-Type");
+  return rapi_json_text(r, 201, "{{\"done\":true}");
+}
+
+// A different key arrives while the only slot is taken.
+fn crowded(r: RapiReq*) -> int32 {
+  var h: THttp* = go(g_api2, "POST", r->ctx->req->path, "", "", key("other"));
+  g_inner = t_status(h);
+  g_inner_retry = t_hdr(h, "Retry-After");
+  return rapi_json_text(r, 201, "{{}");
+}
+
+fn big(r: RapiReq*) -> int32 {
+  g_runs = g_runs + 1;
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add_repeat(b, 97, (int64)1048576 + 10);
+  var st: int32 = rz_ctx_bytes(r->ctx, 200, "text/plain", rz_buf_str(b));
+  rz_buf_free(b);
+  return st;
+}
+
+fn build() {
+  g_api = rapi_new((RzApp*)0, "/api", "Orders", "1");
+  rapi_before(g_api, &who);
+  rapi_use_idempotency(g_api, 60, 100);
+  rapi_idem_clock(g_api, &clock);
+  var op: RapiOp* = rapi_post(g_api, "/orders", &create);
+  rapi_idempotent(op, true);
+  op = rapi_post(g_api, "/orders2", &create);
+  rapi_idempotent(op, true);
+  op = rapi_post(g_api, "/optional", &plain);
+  rapi_idempotent(op, false);
+  op = rapi_post(g_api, "/off", &plain);
+  op = rapi_post(g_api, "/nothing", &nothing);
+  rapi_idempotent(op, true);
+  op = rapi_post(g_api, "/missing", &missing);
+  rapi_idempotent(op, true);
+  op = rapi_post(g_api, "/flaky", &flaky);
+  rapi_idempotent(op, true);
+  op = rapi_post(g_api, "/slow", &slow);
+  rapi_idempotent(op, true);
+  op = rapi_post(g_api, "/big", &big);
+  rapi_idempotent(op, true);
+
+  g_api2 = rapi_new((RzApp*)0, "/small", "Small", "1");
+  rapi_use_idempotency(g_api2, 60, 2);
+  rapi_idem_clock(g_api2, &clock);
+  op = rapi_post(g_api2, "/orders", &create);
+  rapi_idempotent(op, true);
+  op = rapi_post(g_api2, "/crowded", &crowded);
+  rapi_idempotent(op, true);
+}
+
+fn parse_ok(name: string, raw: string, want: string) {
+  var a: RzArena* = rz_arena_new();
+  var out: string = "";
+  t_ok("{name} parses", rapi_idem_parse(raw, a, &out));
+  t_str("{name} key", out, want);
+  rz_arena_free(a);
+}
+
+fn parse_bad(name: string, raw: string) {
+  var a: RzArena* = rz_arena_new();
+  var out: string = "";
+  t_ok("{name} is rejected", !rapi_idem_parse(raw, a, &out));
+  rz_arena_free(a);
+}
+
+fn repeat_char(c: int32, n: int64) -> string {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add_repeat(b, c, n);
+  var s: string = rz_str_dup(rz_buf_str(b));
+  rz_buf_free(b);
+  return s;
+}
+
+fn main() -> int32 {
+  build();
+  t_str("no decl errors", rapi_error(g_api), "");
+  t_str("no decl errors small", rapi_error(g_api2), "");
+
+  // The header value.
+  parse_ok("quoted", "\"8e03978e-40d5-43e8-bc93-6894a57f9324\"", "8e03978e-40d5-43e8-bc93-6894a57f9324");
+  parse_ok("escapes", "\"a\\\"b\\\\c\"", "a\"b\\c");
+  parse_ok("spaces", "\"a b\"", "a b");
+  parse_ok("bare token", "abc-123", "abc-123");
+  parse_ok("bare uuid", "8e03978e-40d5", "8e03978e-40d5");
+  parse_ok("longest", "\"{repeat_char(120, 255)}\"", repeat_char(120, 255));
+  parse_bad("empty", "");
+  parse_bad("empty quotes", "\"\"");
+  parse_bad("one quote", "\"");
+  parse_bad("open", "\"abc");
+  parse_bad("trailing", "\"abc\"x");
+  parse_bad("two strings", "\"a\" \"b\"");
+  parse_bad("inner quote", "\"a\"b\"");
+  parse_bad("bad escape", "\"a\\qb\"");
+  parse_bad("escaped end", "\"abc\\\"");
+  parse_bad("lone backslash", "\"abc\\");
+  parse_bad("tab inside", "\"a\tb\"");
+  parse_bad("non ascii", "\"café\"");
+  parse_bad("too long", "\"{repeat_char(120, 256)}\"");
+  parse_bad("long bare", repeat_char(120, 256));
+  parse_bad("bare with space", "a b");
+  parse_bad("bare with quote", "a\"b");
+  parse_bad("params", "\"a\";p=1");
+
+  // Missing key.
+  var h: THttp* = go(g_api, "POST", "/api/orders", "", "{{\"a\":1}", "Content-Type: application/json");
+  t_eq("missing key", t_status(h), 400);
+  t_str("missing key type", t_hdr(h, "Content-Type"), "application/problem+json");
+  t_has("missing key title", t_body(h), "\"title\":\"Idempotency-Key is missing.\"");
+  t_has("missing key type uri", t_body(h), "\"type\":\"urn:raize-api:problem:idempotency-key-missing\"");
+  t_eq("handler not run", g_runs, 0);
+  t_eq("nothing reserved", rapi_idem_count(g_api), 0);
+
+  // First call, retry, replay.
+  h = go(g_api, "POST", "/api/orders", "", "{{\"a\":1}", key("k1"));
+  t_eq("first", t_status(h), 201);
+  t_eq("first ran", g_runs, 1);
+  t_str("first body", t_body(h), "{{\"n\":1}");
+  t_str("first location", t_hdr(h, "Location"), "/orders/1");
+  t_str("first not replayed", t_hdr(h, "Idempotent-Replayed"), "");
+  t_eq("one entry", rapi_idem_count(g_api), 1);
+
+  h = go(g_api, "POST", "/api/orders", "", "{{\"a\":1}", key("k1"));
+  t_eq("retry", t_status(h), 201);
+  t_eq("retry did not run", g_runs, 1);
+  t_str("retry body", t_body(h), "{{\"n\":1}");
+  t_str("retry location", t_hdr(h, "Location"), "/orders/1");
+  t_str("retry content type", t_hdr(h, "Content-Type"), "application/json");
+  t_str("retry replayed", t_hdr(h, "Idempotent-Replayed"), "true");
+  h = go(g_api, "POST", "/api/orders", "", "{{\"a\":1}", key("k1"));
+  t_str("retry again", t_body(h), "{{\"n\":1}");
+  t_eq("still one entry", rapi_idem_count(g_api), 1);
+
+  // The same key with another request.
+  h = go(g_api, "POST", "/api/orders", "", "{{\"a\":2}", key("k1"));
+  t_eq("other body", t_status(h), 422);
+  t_str("other body type", t_hdr(h, "Content-Type"), "application/problem+json");
+  t_has("other body title", t_body(h), "\"title\":\"Idempotency-Key is already used.\"");
+  t_has("other body type uri", t_body(h), "idempotency-key-reused");
+  h = go(g_api, "POST", "/api/orders", "x=1", "{{\"a\":1}", key("k1"));
+  t_eq("other query", t_status(h), 422);
+  h = go(g_api, "POST", "/api/orders2", "", "{{\"a\":1}", key("k1"));
+  t_eq("other path", t_status(h), 422);
+  t_eq("none of them ran", g_runs, 1);
+
+  // A different key runs the handler.
+  h = go(g_api, "POST", "/api/orders", "", "{{\"a\":1}", key("k2"));
+  t_eq("new key", t_status(h), 201);
+  t_eq("new key ran", g_runs, 2);
+  t_str("new key body", t_body(h), "{{\"n\":2}");
+
+  // A bare token works the same way.
+  h = go(g_api, "POST", "/api/orders", "", "", "Idempotency-Key: bare-1");
+  t_eq("bare", t_status(h), 201);
+  h = go(g_api, "POST", "/api/orders", "", "", "Idempotency-Key: bare-1");
+  t_str("bare replayed", t_hdr(h, "Idempotent-Replayed"), "true");
+  var runs: int32 = g_runs;
+
+  // Bad headers.
+  var bad: string[8] = ["\"open", "\"a\"x", "\"\"", "\"a\\qb\"", "", "a b", "\"a\", \"b\"", "\"café\""];
+  for i in 0..8 {
+    h = go(g_api, "POST", "/api/orders", "", "", "Idempotency-Key: {bad[i]}");
+    t_eq("bad header {i}", t_status(h), 400);
+    t_has("bad header {i} title", t_body(h), "\"title\":\"Idempotency-Key is invalid.\"");
+  }
+  h = go(g_api, "POST", "/api/orders", "", "", "Idempotency-Key: \"d1\"\nIdempotency-Key: \"d1\"");
+  t_eq("two headers", t_status(h), 400);
+  h = go(g_api, "POST", "/api/orders", "", "", "Idempotency-Key: \"{repeat_char(120, 256)}\"");
+  t_eq("256 characters", t_status(h), 400);
+  h = go(g_api, "POST", "/api/orders", "", "", "Idempotency-Key: \"{repeat_char(120, 255)}\"");
+  t_eq("255 characters", t_status(h), 201);
+  runs = runs + 1;
+  t_eq("bad headers did not run", g_runs, runs);
+
+  // Optional keys, and operations that do not take part.
+  h = go(g_api, "POST", "/api/optional", "", "", "");
+  t_eq("optional without key", t_status(h), 200);
+  h = go(g_api, "POST", "/api/optional", "", "", "Idempotency-Key: \"o1\"");
+  t_eq("optional with key", t_status(h), 200);
+  h = go(g_api, "POST", "/api/optional", "", "", "Idempotency-Key: \"o1\"");
+  t_str("optional replayed", t_hdr(h, "Idempotent-Replayed"), "true");
+  h = go(g_api, "POST", "/api/optional", "", "", "Idempotency-Key: \"bad");
+  t_eq("optional but malformed", t_status(h), 400);
+  runs = g_runs;
+  h = go(g_api, "POST", "/api/off", "", "", "Idempotency-Key: \"f1\"");
+  h = go(g_api, "POST", "/api/off", "", "", "Idempotency-Key: \"f1\"");
+  t_eq("off runs every time", g_runs, runs + 2);
+  t_str("off not replayed", t_hdr(h, "Idempotent-Replayed"), "");
+
+  // Responses without a body, and errors below 500, are replayed too.
+  h = go(g_api, "POST", "/api/nothing", "", "", key("n1"));
+  t_eq("no content", t_status(h), 204);
+  runs = g_runs;
+  h = go(g_api, "POST", "/api/nothing", "", "", key("n1"));
+  t_eq("no content replay", t_status(h), 204);
+  t_eq("no content replay body", (int64)t_body(h).length, 0);
+  t_str("no content replayed", t_hdr(h, "Idempotent-Replayed"), "true");
+  t_eq("no content did not run", g_runs, runs);
+  h = go(g_api, "POST", "/api/missing", "", "", key("m1"));
+  t_eq("404", t_status(h), 404);
+  h = go(g_api, "POST", "/api/missing", "", "", key("m1"));
+  t_eq("404 replay", t_status(h), 404);
+  t_str("404 replay type", t_hdr(h, "Content-Type"), "application/problem+json");
+  t_has("404 replay body", t_body(h), "\"detail\":\"no such order\"");
+  t_str("404 replayed", t_hdr(h, "Idempotent-Replayed"), "true");
+
+  // A request still running: 409.
+  runs = g_runs;
+  h = go(g_api, "POST", "/api/slow", "", "{{\"a\":1}", key("slow-1"));
+  t_eq("slow", t_status(h), 201);
+  t_eq("same request meanwhile", g_inner, 409);
+  t_str("conflict is a problem", g_inner_retry, "application/problem+json");
+  t_eq("slow ran once", g_runs, runs + 1);
+  h = go(g_api, "POST", "/api/slow", "", "{{\"a\":1}", key("slow-1"));
+  t_str("slow replayed", t_hdr(h, "Idempotent-Replayed"), "true");
+  t_has("slow replay body", t_body(h), "\"done\":true");
+  h = go(g_api, "POST", "/api/slow", "", "{{\"a\":1}", key("slow-1"));
+  t_eq("slow replay status", t_status(h), 201);
+
+  // 5xx releases the key.
+  h = go(g_api, "POST", "/api/flaky", "", "", key("fl-1"));
+  t_eq("flaky 500", t_status(h), 500);
+  t_eq("released", g_flaky, 1);
+  h = go(g_api, "POST", "/api/flaky", "", "", key("fl-1"));
+  t_eq("flaky retry runs", t_status(h), 201);
+  t_eq("flaky ran again", g_flaky, 2);
+  t_str("flaky retry is new", t_hdr(h, "Idempotent-Replayed"), "");
+  h = go(g_api, "POST", "/api/flaky", "", "", key("fl-1"));
+  t_eq("flaky replay", t_status(h), 201);
+  t_eq("flaky did not run a third time", g_flaky, 2);
+  t_str("flaky replayed", t_hdr(h, "Idempotent-Replayed"), "true");
+
+  // A body over 1 MiB is not kept.
+  runs = g_runs;
+  var before: int32 = rapi_idem_count(g_api);
+  h = go(g_api, "POST", "/api/big", "", "", key("big-1"));
+  t_eq("big", t_status(h), 200);
+  t_eq("big body", (int64)t_body(h).length, (int64)1048576 + 10);
+  t_eq("big not kept", rapi_idem_count(g_api), before);
+  h = go(g_api, "POST", "/api/big", "", "", key("big-1"));
+  t_eq("big runs again", g_runs, runs + 2);
+  t_str("big not replayed", t_hdr(h, "Idempotent-Replayed"), "");
+
+  // Expiry: 60 seconds.
+  g_now = 5000000;
+  h = go(g_api, "POST", "/api/orders", "", "{{\"e\":1}", key("exp-1"));
+  runs = g_runs;
+  g_now = g_now + 59999;
+  h = go(g_api, "POST", "/api/orders", "", "{{\"e\":1}", key("exp-1"));
+  t_str("before expiry", t_hdr(h, "Idempotent-Replayed"), "true");
+  t_eq("before expiry did not run", g_runs, runs);
+  g_now = g_now + 1;
+  h = go(g_api, "POST", "/api/orders", "", "{{\"e\":1}", key("exp-1"));
+  t_str("after expiry", t_hdr(h, "Idempotent-Replayed"), "");
+  t_eq("after expiry ran", g_runs, runs + 1);
+  // An expired key can be used for another request.
+  g_now = g_now + 61000;
+  h = go(g_api, "POST", "/api/orders", "", "{{\"e\":2}", key("exp-1"));
+  t_eq("expired key, new request", t_status(h), 201);
+  t_str("expired key, not replayed", t_hdr(h, "Idempotent-Replayed"), "");
+
+  // Scoping by caller.
+  runs = g_runs;
+  h = go(g_api, "POST", "/api/orders", "", "{{\"s\":1}", "Idempotency-Key: \"shared\"\nX-User: alice");
+  t_eq("alice", t_status(h), 201);
+  h = go(g_api, "POST", "/api/orders", "", "{{\"s\":2}", "Idempotency-Key: \"shared\"\nX-User: bob");
+  t_eq("bob can use the same key", t_status(h), 201);
+  t_eq("both ran", g_runs, runs + 2);
+  h = go(g_api, "POST", "/api/orders", "", "{{\"s\":1}", "Idempotency-Key: \"shared\"\nX-User: alice");
+  t_str("alice replay", t_hdr(h, "Idempotent-Replayed"), "true");
+  var first_n: int32 = runs + 1;
+  t_has("alice replay body", t_body(h), "{{\"n\":{first_n}}");
+  h = go(g_api, "POST", "/api/orders", "", "{{\"s\":2}", "Idempotency-Key: \"shared\"\nX-User: bob");
+  t_str("bob replay", t_hdr(h, "Idempotent-Replayed"), "true");
+  var second_n: int32 = runs + 2;
+  t_has("bob replay body", t_body(h), "{{\"n\":{second_n}}");
+  h = go(g_api, "POST", "/api/orders", "", "{{\"s\":1}", "Idempotency-Key: \"shared\"\nX-User: bob");
+  t_eq("bob with alice's request", t_status(h), 422);
+  h = go(g_api, "POST", "/api/orders", "", "{{\"s\":1}", "Idempotency-Key: \"shared\"");
+  t_str("anonymous is its own scope", t_hdr(h, "Idempotent-Replayed"), "");
+
+  // A full table: the oldest completed entry goes (capacity 2).
+  runs = g_runs;
+  h = go(g_api2, "POST", "/small/orders", "", "", key("a"));
+  h = go(g_api2, "POST", "/small/orders", "", "", key("b"));
+  t_eq("two entries", rapi_idem_count(g_api2), 2);
+  h = go(g_api2, "POST", "/small/orders", "", "", key("c"));
+  t_eq("third key", t_status(h), 201);
+  t_eq("still two entries", rapi_idem_count(g_api2), 2);
+  h = go(g_api2, "POST", "/small/orders", "", "", key("c"));
+  t_str("newest kept", t_hdr(h, "Idempotent-Replayed"), "true");
+  h = go(g_api2, "POST", "/small/orders", "", "", key("b"));
+  t_str("second oldest kept", t_hdr(h, "Idempotent-Replayed"), "true");
+  h = go(g_api2, "POST", "/small/orders", "", "", key("a"));
+  t_str("oldest was evicted", t_hdr(h, "Idempotent-Replayed"), "");
+  t_eq("still two after reuse", rapi_idem_count(g_api2), 2);
+  // Expired entries go before live ones.
+  g_now = g_now + 30000;
+  h = go(g_api2, "POST", "/small/orders", "", "", key("d"));
+  g_now = g_now + 40000;
+  h = go(g_api2, "POST", "/small/orders", "", "", key("e"));
+  h = go(g_api2, "POST", "/small/orders", "", "", key("d"));
+  t_str("live entry kept over expired", t_hdr(h, "Idempotent-Replayed"), "true");
+
+  // A request in flight takes a slot; a second key evicts a completed entry.
+  g_now = g_now + 120000;
+  h = go(g_api2, "POST", "/small/orders", "", "", key("f1"));
+  h = go(g_api2, "POST", "/small/crowded", "", "", key("crowd"));
+  t_eq("crowded outer", t_status(h), 201);
+  t_eq("room for the nested request", g_inner, 201);
+
+  // Every slot in flight: 503, and nothing in flight is evicted.
+
+  var tiny: RapiApi* = rapi_new((RzApp*)0, "/tiny", "Tiny", "1");
+  rapi_use_idempotency(tiny, 60, 1);
+  rapi_idem_clock(tiny, &clock);
+  var op: RapiOp* = rapi_post(tiny, "/crowded", &crowded);
+  rapi_idempotent(op, true);
+  g_api2 = tiny;
+  h = go(tiny, "POST", "/tiny/crowded", "", "", key("outer"));
+  t_eq("tiny outer", t_status(h), 201);
+  t_eq("full of in-flight entries", g_inner, 503);
+  t_str("retry after", g_inner_retry, "1");
+  t_eq("tiny keeps the outer", rapi_idem_count(tiny), 1);
+  h = go(tiny, "POST", "/tiny/crowded", "", "", key("outer"));
+  t_str("outer replayed", t_hdr(h, "Idempotent-Replayed"), "true");
+
+  // The OpenAPI document lists the header.
+  h = go(g_api, "GET", "/api/openapi.json", "", "", "");
+  t_eq("openapi", t_status(h), 200);
+  t_has("openapi header", t_body(h), "\"name\":\"Idempotency-Key\",\"in\":\"header\",\"required\":true");
+
+  // Setting it up twice is a mistake.
+  rapi_use_idempotency(g_api, 60, 10);
+  t_has("twice", rapi_error(g_api), "twice");
+  rapi_idempotent((RapiOp*)0, true);
+  return t_done();
+}

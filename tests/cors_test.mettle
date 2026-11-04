@@ -1,0 +1,206 @@
+// CORS: allow list, credentials, preflight, Vary.
+import "std/mem";
+import "raize_api/raize_api";
+import "raize_api/cors/cors";
+import "tutil";
+import "http";
+
+fn items_get(r: RapiReq*) -> int32 { return rapi_json_text(r, 200, "[]"); }
+fn items_post(r: RapiReq*) -> int32 { return rapi_json_text(r, 201, "{{}"); }
+
+fn build() -> RapiApi* {
+  var api: RapiApi* = rapi_new((RzApp*)0, "/api", "T", "1");
+  rapi_group(api, "/v1");
+  rapi_get(api, "/items", &items_get);
+  rapi_post(api, "/items", &items_post);
+  rapi_get(api, "/items/:id", &items_get);
+  rapi_group_end(api);
+  return api;
+}
+
+fn get_with(api: RapiApi*, headers: string) -> THttp* {
+  var h: THttp* = t_req("GET", "/api/v1/items", "", "", headers);
+  rapi_handle(api, &h->ctx);
+  return h;
+}
+
+fn preflight(api: RapiApi*, path: string, headers: string) -> THttp* {
+  var h: THttp* = t_req("OPTIONS", path, "", "", headers);
+  rapi_handle(api, &h->ctx);
+  return h;
+}
+
+fn main() -> int32 {
+  var api: RapiApi* = build();
+  t_str("no decl errors", rapi_error(api), "");
+
+  // Without CORS set up nothing changes.
+  var h: THttp* = get_with(api, "Origin: https://a.com");
+  t_str("off: no ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "");
+
+  rapi_use_cors(api, "https://a.com https://b.com:8443", false, 600);
+
+  // No Origin header: not a CORS request.
+  h = get_with(api, "");
+  t_eq("no origin status", t_status(h), 200);
+  t_str("no origin: no ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "");
+
+  // An allowed origin is echoed.
+  h = get_with(api, "Origin: https://a.com");
+  t_eq("allowed status", t_status(h), 200);
+  t_str("allowed ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "https://a.com");
+  t_str("allowed vary", t_hdr(h, "Vary"), "Origin");
+  t_str("allowed no credentials", t_hdr(h, "Access-Control-Allow-Credentials"), "");
+  t_str("allowed expose", t_hdr(h, "Access-Control-Expose-Headers"),
+    "Location, ETag, Link, Retry-After, RateLimit, RateLimit-Policy, Deprecation, Sunset, Idempotent-Replayed");
+  h = get_with(api, "Origin: https://b.com:8443");
+  t_str("allowed with port", t_hdr(h, "Access-Control-Allow-Origin"), "https://b.com:8443");
+
+  // Not in the list: never reflected.
+  h = get_with(api, "Origin: https://evil.com");
+  t_eq("denied still served", t_status(h), 200);
+  t_str("denied: no ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  t_str("denied: no expose", t_hdr(h, "Access-Control-Expose-Headers"), "");
+  t_str("denied vary", t_hdr(h, "Vary"), "Origin");
+  h = get_with(api, "Origin: https://b.com");
+  t_str("other port denied", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  h = get_with(api, "Origin: https://a.com.evil.com");
+  t_str("suffix denied", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  h = get_with(api, "Origin: http://a.com");
+  t_str("scheme denied", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  h = get_with(api, "Origin: HTTPS://A.COM");
+  t_str("case does not matter", t_hdr(h, "Access-Control-Allow-Origin"), "HTTPS://A.COM");
+  h = get_with(api, "Origin: null");
+  t_str("null denied", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  h = get_with(api, "Origin: https://a.com https://evil.com");
+  t_str("two origins denied", t_hdr(h, "Access-Control-Allow-Origin"), "");
+
+  // Error responses carry the headers too.
+  h = t_req("GET", "/api/v1/nothing", "", "", "Origin: https://a.com");
+  t_eq("404 status", rapi_handle(api, &h->ctx), 404);
+  t_str("404 ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "https://a.com");
+  h = t_req("DELETE", "/api/v1/items", "", "", "Origin: https://a.com");
+  t_eq("405 status", rapi_handle(api, &h->ctx), 405);
+  t_str("405 ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "https://a.com");
+
+  // Preflight.
+  h = preflight(api, "/api/v1/items",
+    "Origin: https://a.com\nAccess-Control-Request-Method: POST\nAccess-Control-Request-Headers: Content-Type, X-Token");
+  t_eq("preflight status", t_status(h), 204);
+  t_str("preflight ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "https://a.com");
+  t_str("preflight methods", t_hdr(h, "Access-Control-Allow-Methods"), "GET, HEAD, POST, OPTIONS");
+  t_str("preflight headers", t_hdr(h, "Access-Control-Allow-Headers"), "content-type, x-token");
+  t_str("preflight max-age", t_hdr(h, "Access-Control-Max-Age"), "600");
+  t_has("preflight vary", t_hdr(h, "Vary"), "Origin");
+  t_has("preflight vary headers", t_hdr(h, "Vary"), "Access-Control-Request-Headers");
+  t_eq("preflight body empty", (int64)t_body(h).length, 0);
+
+  h = preflight(api, "/api/v1/items/7", "Origin: https://a.com\nAccess-Control-Request-Method: GET");
+  t_eq("preflight param path", t_status(h), 204);
+  t_str("preflight param methods", t_hdr(h, "Access-Control-Allow-Methods"), "GET, HEAD, OPTIONS");
+  t_str("preflight no request headers", t_hdr(h, "Access-Control-Allow-Headers"), "");
+
+  // A method the path does not serve.
+  h = preflight(api, "/api/v1/items/7", "Origin: https://a.com\nAccess-Control-Request-Method: DELETE");
+  t_eq("preflight bad method status", t_status(h), 204);
+  t_str("preflight bad method: no methods", t_hdr(h, "Access-Control-Allow-Methods"), "");
+  t_str("preflight bad method: no max-age", t_hdr(h, "Access-Control-Max-Age"), "");
+  h = preflight(api, "/api/v1/items/7", "Origin: https://a.com\nAccess-Control-Request-Method: get");
+  t_str("preflight lower-case method", t_hdr(h, "Access-Control-Allow-Methods"), "");
+  h = preflight(api, "/api/v1/items", "Origin: https://a.com\nAccess-Control-Request-Method: PO ST");
+  t_str("preflight bad method token", t_hdr(h, "Access-Control-Allow-Methods"), "");
+
+  // A bad header name: the list is left out.
+  h = preflight(api, "/api/v1/items",
+    "Origin: https://a.com\nAccess-Control-Request-Method: POST\nAccess-Control-Request-Headers: X-Ok, bad name");
+  t_eq("preflight bad header status", t_status(h), 204);
+  t_str("preflight bad header list", t_hdr(h, "Access-Control-Allow-Headers"), "");
+  t_str("preflight bad header still methods", t_hdr(h, "Access-Control-Allow-Methods"), "GET, HEAD, POST, OPTIONS");
+  h = preflight(api, "/api/v1/items",
+    "Origin: https://a.com\nAccess-Control-Request-Method: POST\nAccess-Control-Request-Headers: x-a,,  X-B ,");
+  t_str("preflight header spacing", t_hdr(h, "Access-Control-Allow-Headers"), "x-a, x-b");
+
+  // A path with no operation is a 404, not a preflight answer.
+  h = preflight(api, "/api/v1/missing", "Origin: https://a.com\nAccess-Control-Request-Method: GET");
+  t_eq("preflight no op", t_status(h), 404);
+  t_str("preflight no op methods", t_hdr(h, "Access-Control-Allow-Methods"), "");
+
+  // A denied origin gets 204 with no CORS headers.
+  h = preflight(api, "/api/v1/items", "Origin: https://evil.com\nAccess-Control-Request-Method: GET");
+  t_eq("preflight denied status", t_status(h), 204);
+  t_str("preflight denied ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  t_str("preflight denied methods", t_hdr(h, "Access-Control-Allow-Methods"), "");
+  t_str("preflight denied max-age", t_hdr(h, "Access-Control-Max-Age"), "");
+
+  // OPTIONS with an Origin but no Access-Control-Request-Method is an ordinary request.
+  h = preflight(api, "/api/v1/items", "Origin: https://a.com");
+  t_eq("plain options", t_status(h), 204);
+  t_str("plain options allow", t_hdr(h, "Allow"), "GET, HEAD, POST, OPTIONS");
+  t_str("plain options no methods", t_hdr(h, "Access-Control-Allow-Methods"), "");
+  t_str("plain options ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "https://a.com");
+
+  // max_age 0 leaves the header out; credentials always echo the origin.
+  rapi_use_cors(api, "https://a.com", true, 0);
+  h = preflight(api, "/api/v1/items", "Origin: https://a.com\nAccess-Control-Request-Method: GET");
+  t_str("no max-age", t_hdr(h, "Access-Control-Max-Age"), "");
+  t_str("credentials header", t_hdr(h, "Access-Control-Allow-Credentials"), "true");
+  t_str("credentials ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "https://a.com");
+  h = get_with(api, "Origin: https://a.com");
+  t_str("credentials on actual", t_hdr(h, "Access-Control-Allow-Credentials"), "true");
+  h = get_with(api, "Origin: https://evil.com");
+  t_str("credentials denied", t_hdr(h, "Access-Control-Allow-Credentials"), "");
+
+  // "*" without credentials answers "*"; with credentials it echoes.
+  rapi_use_cors(api, "*", false, 0);
+  h = get_with(api, "Origin: https://anything.example");
+  t_str("star ACAO", t_hdr(h, "Access-Control-Allow-Origin"), "*");
+  t_str("star vary", t_hdr(h, "Vary"), "Origin");
+  t_str("star no credentials", t_hdr(h, "Access-Control-Allow-Credentials"), "");
+  h = get_with(api, "Origin: null");
+  t_str("star does not cover null", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  h = get_with(api, "");
+  t_str("star without origin", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  rapi_use_cors(api, "*", true, 0);
+  h = get_with(api, "Origin: https://anything.example");
+  t_str("star+credentials echoes", t_hdr(h, "Access-Control-Allow-Origin"), "https://anything.example");
+  t_str("star+credentials header", t_hdr(h, "Access-Control-Allow-Credentials"), "true");
+  h = get_with(api, "Origin: null");
+  t_str("star+credentials null", t_hdr(h, "Access-Control-Allow-Origin"), "");
+
+  // "null" works when listed.
+  rapi_use_cors(api, "null https://a.com/", false, 0);
+  h = get_with(api, "Origin: null");
+  t_str("null listed", t_hdr(h, "Access-Control-Allow-Origin"), "null");
+  h = get_with(api, "Origin: https://a.com");
+  t_str("trailing slash in list", t_hdr(h, "Access-Control-Allow-Origin"), "https://a.com");
+
+  // Odd input never reflects and never crashes.
+  rapi_use_cors(api, "*", true, 0);
+  h = get_with(api, "Origin: has space");
+  t_str("origin with space", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  h = get_with(api, "Origin: ");
+  t_str("empty origin", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  var long_origin: RzBuf* = rz_buf_new();
+  rz_buf_add(long_origin, "Origin: https://");
+  rz_buf_add_repeat(long_origin, 97, 600);
+  h = get_with(api, rz_buf_str(long_origin));
+  t_str("huge origin", t_hdr(h, "Access-Control-Allow-Origin"), "");
+  rz_buf_free(long_origin);
+  rapi_use_cors(api, "", false, 0);
+  h = get_with(api, "Origin: https://a.com");
+  t_str("empty list denies all", t_hdr(h, "Access-Control-Allow-Origin"), "");
+
+  // rapi_vary_add: appends, never duplicates, leaves "*" alone.
+  h = t_req("GET", "/api/v1/items", "", "", "");
+  rz_ctx_set_header(&h->ctx, "Vary", "Accept");
+  rapi_vary_add(&h->ctx, "Origin");
+  t_str("vary append", t_hdr(h, "Vary"), "Accept, Origin");
+  rapi_vary_add(&h->ctx, "origin");
+  t_str("vary no duplicate", t_hdr(h, "Vary"), "Accept, Origin");
+  rapi_vary_add(&h->ctx, "Accept-Encoding");
+  t_str("vary third", t_hdr(h, "Vary"), "Accept, Origin, Accept-Encoding");
+  rz_ctx_set_header(&h->ctx, "Vary", "*");
+  rapi_vary_add(&h->ctx, "Origin");
+  t_str("vary star", t_hdr(h, "Vary"), "*");
+  return t_done();
+}
