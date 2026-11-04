@@ -1,0 +1,45 @@
+// @rapi_model: a struct's API type written by the compiler.
+import "std/mem";
+import "raize_api/raize_api";
+import "raize_api/types/model";
+import "codec/core/list";
+import "tutil";
+
+@rapi_model struct Label {
+  name: string;
+}
+
+@rapi_model struct Note {
+  id: int64;
+  title: string;
+  stars: int32;
+  ratio: float64;
+  pinned: bool;
+  labels: CodecList<Label>;
+  words: CodecList<string>;
+  main: Label;
+}
+
+fn main() -> int32 {
+  var t: RapiType* = Note_rapi();
+  t_ok("same", Note_rapi() == t);
+  t_eq("fields", (int64)t->nfields, 8);
+  t_eq("labels kind", (int64)rapi_field_type(t, "labels")->kind, (int64)RAPI_T_ARRAY);
+  t_eq("main kind", (int64)rapi_field_type(t, "main")->kind, (int64)RAPI_T_OBJECT);
+  rapi_read_only(t, "id");
+  rapi_require(t, "ratio", false);
+  var a: RzArena* = rz_arena_new();
+  var e: RapiErrors;
+  var n: Note;
+  memset((rawptr)&n, 0, sizeof(Note));
+  var rc: int32 = rapi_decode(t, "{{\"title\":\"t\",\"stars\":4,\"pinned\":false,\"labels\":[{{\"name\":\"x\"}],\"words\":[\"a\",\"b\"],\"main\":{{\"name\":\"m\"}}", (rawptr)&n, a, &e, (int64*)0);
+  t_eq("rc", (int64)rc, RAPI_DECODE_OK);
+  t_str("main", n.main.name, "m");
+  t_str("word", n.words.data[1], "b");
+  t_str("label", n.labels.data[0].name, "x");
+  var b: CodecBuf;
+  codec_buf_init(&b, 64);
+  rapi_encode(&b, t, (rawptr)&n);
+  t_str("enc", codec_buf_view(&b), "{{\"id\":0,\"title\":\"t\",\"stars\":4,\"ratio\":0,\"pinned\":false,\"labels\":[{{\"name\":\"x\"}],\"words\":[\"a\",\"b\"],\"main\":{{\"name\":\"m\"}}");
+  return t_done();
+}

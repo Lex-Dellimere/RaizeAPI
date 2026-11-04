@@ -1,0 +1,111 @@
+// Types: building, decoding, validation errors and encoding.
+import "std/mem";
+import "raize_api/raize_api";
+import "codec/core/list";
+import "tutil";
+
+struct Tag { name: string; }
+struct Task {
+  id: int64;
+  title: string;
+  done: bool;
+  prio: int32;
+  score: float64;
+  tags: CodecList<Tag>;
+  meta: string;
+}
+
+fn tag_type() -> RapiType* {
+  var v: Tag;
+  var t: RapiType* = rapi_object_t("Tag", (int64)sizeof(Tag));
+  rapi_field(t, "name", rapi_len(rapi_string_t(), 1, 8), (int64)((uint8*)&v.name - (uint8*)&v), true);
+  return t;
+}
+
+fn task_type() -> RapiType* {
+  var v: Task;
+  var base: uint8* = (uint8*)&v;
+  var t: RapiType* = rapi_object_t("Task", (int64)sizeof(Task));
+  rapi_field(t, "id", rapi_int64_t(), (int64)((uint8*)&v.id - base), false);
+  rapi_field(t, "title", rapi_len(rapi_string_t(), 1, 10), (int64)((uint8*)&v.title - base), true);
+  rapi_field(t, "done", rapi_bool_t(), (int64)((uint8*)&v.done - base), false);
+  rapi_field(t, "prio", rapi_range(rapi_int32_t(), 1, 5), (int64)((uint8*)&v.prio - base), false);
+  rapi_field(t, "score", rapi_number_t(), (int64)((uint8*)&v.score - base), false);
+  rapi_field(t, "tags", rapi_items(rapi_array_t(tag_type()), RAPI_UNSET, 3), (int64)((uint8*)&v.tags - base), false);
+  rapi_field(t, "meta", rapi_nullable(rapi_any_t()), (int64)((uint8*)&v.meta - base), false);
+  rapi_read_only(t, "id");
+  return t;
+}
+
+fn enc(t: RapiType*, v: rawptr) -> string {
+  var b: CodecBuf;
+  codec_buf_init(&b, 64);
+  rapi_encode(&b, t, v);
+  return codec_buf_take(&b);
+}
+
+fn main() -> int32 {
+  var a: RzArena* = rz_arena_new();
+  var t: RapiType* = task_type();
+  var e: RapiErrors;
+  var v: Task;
+  memset((rawptr)&v, 0, sizeof(Task));
+  var present: int64 = 0;
+
+  var rc: int32 = rapi_decode(t, "{{\"title\":\"milk\",\"done\":true,\"prio\":2,\"score\":1.5,\"tags\":[{{\"name\":\"a\"},{{\"name\":\"b\\u00e9\"}],\"meta\":{{\"x\":[1,2]}}", (rawptr)&v, a, &e, &present);
+  t_eq("ok rc", (int64)rc, RAPI_DECODE_OK);
+  t_str("title", v.title, "milk");
+  t_ok("done", v.done);
+  t_eq("prio", (int64)v.prio, 2);
+  t_eq("tags", v.tags.len, 2);
+  t_str("tag 1", v.tags.data[1].name, "bé");
+  t_str("meta raw", v.meta, "{{\"x\":[1,2]}");
+  t_eq("present", present, 2 + 4 + 8 + 16 + 32 + 64);
+  t_str("encode", enc(t, (rawptr)&v), "{{\"id\":0,\"title\":\"milk\",\"done\":true,\"prio\":2,\"score\":1.5,\"tags\":[{{\"name\":\"a\"},{{\"name\":\"bé\"}],\"meta\":{{\"x\":[1,2]}}");
+
+  memset((rawptr)&v, 0, sizeof(Task));
+  rc = rapi_decode(t, "{{\"id\":3,\"title\":\"\",\"prio\":9,\"done\":\"no\",\"tags\":[{{},{{\"name\":\"toolongname\"},1,2],\"title\":\"x\"}", (rawptr)&v, a, &e, &present);
+  t_eq("invalid rc", (int64)rc, RAPI_DECODE_INVALID);
+  var b: CodecBuf;
+  codec_buf_init(&b, 64);
+  var p: RapiProblem;
+  memset((rawptr)&p, 0, sizeof(RapiProblem));
+  p.status = 422;
+  p.errors = &e;
+  rapi_problem_write(&p, &b);
+  var got: string = codec_buf_view(&b);
+  t_has("p status", got, "\"title\":\"Unprocessable Content\",\"status\":422");
+  t_has("p id", got, "{{\"detail\":\"is read-only\",\"pointer\":\"#/id\"}");
+  t_has("p title", got, "{{\"detail\":\"must be at least 1 characters\",\"pointer\":\"#/title\"}");
+  t_has("p prio", got, "{{\"detail\":\"must be at most 5\",\"pointer\":\"#/prio\"}");
+  t_has("p done", got, "{{\"detail\":\"must be a boolean\",\"pointer\":\"#/done\"}");
+  t_has("p tag0", got, "{{\"detail\":\"is required\",\"pointer\":\"#/tags/0/name\"}");
+  t_has("p tag1", got, "{{\"detail\":\"must be at most 8 characters\",\"pointer\":\"#/tags/1/name\"}");
+  t_has("p tag2", got, "{{\"detail\":\"must be an object\",\"pointer\":\"#/tags/2\"}");
+  t_has("p tags", got, "{{\"detail\":\"must have at most 3 items\",\"pointer\":\"#/tags\"}");
+  t_has("p dup", got, "{{\"detail\":\"is given more than once\",\"pointer\":\"#/title\"}");
+
+  rc = rapi_decode(t, "{{\"title\":\"x\",}", (rawptr)&v, a, &e, &present);
+  t_eq("syntax rc", (int64)rc, RAPI_DECODE_SYNTAX);
+  rc = rapi_decode(t, "{{\"title\":\"x\"} []", (rawptr)&v, a, &e, &present);
+  t_eq("trailing rc", (int64)rc, RAPI_DECODE_SYNTAX);
+  rc = rapi_decode(t, "{{\"title\":\"\\xff\"}", (rawptr)&v, a, &e, &present);
+  t_eq("bad escape", (int64)rc, RAPI_DECODE_SYNTAX);
+  rc = rapi_decode(t, "[1]", (rawptr)&v, a, &e, &present);
+  t_eq("not object", (int64)rc, RAPI_DECODE_INVALID);
+  rc = rapi_decode(t, "", (rawptr)&v, a, &e, &present);
+  t_eq("empty", (int64)rc, RAPI_DECODE_SYNTAX);
+
+  t_ok("dt", rapi_is_date_time("2026-11-05T09:30:00.25+01:00"));
+  t_ok("dt z", rapi_is_date_time("2024-02-29t23:59:60z"));
+  t_ok("dt bad day", !rapi_is_date_time("2025-02-29T00:00:00Z"));
+  t_ok("uuid", rapi_is_uuid("123e4567-e89b-12d3-a456-426614174000"));
+  t_ok("email", rapi_is_email("a@b.co") && !rapi_is_email("a@b") && !rapi_is_email("a b@c.d"));
+  t_ok("uri", rapi_is_uri("https://x.y/z") && !rapi_is_uri("nope"));
+  t_eq("utf8", rapi_utf8_count("bé"), 2);
+  var bad: uint8[2];
+  bad[0] = (uint8)192;
+  bad[1] = (uint8)128;
+  t_eq("utf8 bad", rapi_utf8_count(rz_str_view(&bad[0], 2)), -1);
+  return t_done();
+}

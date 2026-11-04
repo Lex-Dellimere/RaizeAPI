@@ -1,0 +1,56 @@
+// Small check helpers shared by the test programs.
+import "std/io";
+
+var g_checks: int32 = 0;
+var g_fails: int32 = 0;
+
+export fn t_ok(name: string, cond: bool) {
+  g_checks = g_checks + 1;
+  if (!cond) {
+    g_fails = g_fails + 1;
+    println("FAIL {name}");
+  }
+}
+
+export fn t_eq(name: string, got: int64, want: int64) {
+  g_checks = g_checks + 1;
+  if (got != want) {
+    g_fails = g_fails + 1;
+    println("FAIL {name}: got {got}, want {want}");
+  }
+}
+
+export fn t_str(name: string, got: string, want: string) {
+  g_checks = g_checks + 1;
+  if (got != want) {
+    g_fails = g_fails + 1;
+    println("FAIL {name}:\n  got  {got}\n  want {want}");
+  }
+}
+
+export fn t_has(name: string, got: string, part: string) {
+  g_checks = g_checks + 1;
+  var found: bool = false;
+  if (part.length <= got.length) {
+    for i in 0..(got.length - part.length + 1) {
+      var same: bool = true;
+      for j in 0..part.length {
+        if (got.chars[i + j] != part.chars[j]) { same = false; break; }
+      }
+      if (same) { found = true; break; }
+    }
+  }
+  if (!found) {
+    g_fails = g_fails + 1;
+    println("FAIL {name}: missing {part}\n  in {got}");
+  }
+}
+
+export fn t_done() -> int32 {
+  if (g_fails > 0) {
+    println("{g_fails} of {g_checks} checks failed");
+    return 1;
+  }
+  println("ok: {g_checks} checks");
+  return 0;
+}
