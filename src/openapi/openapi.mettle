@@ -229,6 +229,10 @@ fn rapi__operation(d: RapiDoc*, api: RapiApi*, op: RapiOp*) {
         codec_json_field_string(w, "style", "form");
         codec_json_field_bool(w, "explode", true);
       }
+      if (p->in == RAPI_IN_QUERY && p->type->kind == RAPI_T_OBJECT) {
+        codec_json_field_string(w, "style", "deepObject");
+        codec_json_field_bool(w, "explode", true);
+      }
       codec_json_key(w, "schema");
       codec_json_object(w);
       rapi__schema_members(d, p->type);

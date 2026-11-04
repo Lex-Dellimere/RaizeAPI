@@ -1,0 +1,105 @@
+// Lists: pages, cursors, filters, sorting, sparse fields and Link headers.
+import "std/mem";
+import "raize_api/raize_api";
+import "raize_api/types/model";
+import "raize_api/query/query";
+import "tutil";
+import "http";
+
+@rapi_model struct Item {
+  id: int64;
+  title: string;
+  prio: int32;
+  done: bool;
+}
+
+var g_items: Item[6];
+
+fn seed() {
+  var titles: string[6] = ["milk", "eggs", "Bread", "jam", "tea", "rice"];
+  var prios: int32[6] = [3, 1, 2, 3, 1, 2];
+  for i in 0..6 {
+    g_items[i].id = (int64)i + 1;
+    g_items[i].title = titles[i];
+    g_items[i].prio = prios[i];
+    g_items[i].done = i % 2 == 0;
+  }
+}
+
+fn list_items(r: RapiReq*) -> int32 {
+  var q: RapiQuery;
+  var st: int32 = rapi_query_parse(r, &q);
+  if (st != RAPI_NEXT) { return st; }
+  var page: rawptr = (rawptr)0;
+  var n: int64 = 0;
+  if (!rapi_query_apply(&q, Item_rapi(), (rawptr)&g_items[0], 6, r->ctx->arena, &page, &n)) { return rapi_fail(r, 500, ""); }
+  return rapi_json_page(r, &q, Item_rapi(), page, n);
+}
+
+fn get(api: RapiApi*, path: string, query: string) -> THttp* {
+  var h: THttp* = t_req("GET", path, query, "", "");
+  rapi_handle(api, &h->ctx);
+  return h;
+}
+
+fn main() -> int32 {
+  seed();
+  var api: RapiApi* = rapi_new((RzApp*)0, "/api", "Items", "1");
+  var op: RapiOp* = rapi_get(api, "/items", &list_items);
+  var l: RapiListing* = rapi_listing(op, Item_rapi(), 2, 5);
+  rapi_listing_sort(op, l, "title prio id");
+  rapi_listing_filter(op, l, "title prio done");
+  rapi_listing_fields(op, l);
+  var op2: RapiOp* = rapi_get(api, "/feed", &list_items);
+  var l2: RapiListing* = rapi_listing(op2, Item_rapi(), 4, 10);
+  rapi_listing_cursor(op2, l2);
+  t_str("decl", rapi_error(api), "");
+
+  var h: THttp* = get(api, "/api/items", "");
+  t_eq("page", t_status(h), 200);
+  t_str("page body", t_body(h), "{{\"items\":[{{\"id\":1,\"title\":\"milk\",\"prio\":3,\"done\":true},{{\"id\":2,\"title\":\"eggs\",\"prio\":1,\"done\":false}],\"total\":6,\"limit\":2,\"offset\":0}");
+  t_str("links", t_hdr(h, "Link"), "</api/items?limit=2&offset=0>; rel=\"first\", </api/items?limit=2&offset=2>; rel=\"next\"");
+
+  h = get(api, "/api/items", "offset=4&limit=2");
+  t_has("last page", t_body(h), "\"total\":6,\"limit\":2,\"offset\":4");
+  t_str("last links", t_hdr(h, "Link"), "</api/items?limit=2&offset=0>; rel=\"first\", </api/items?limit=2&offset=2>; rel=\"prev\"");
+
+  h = get(api, "/api/items", "sort=-prio,title&limit=5&fields=id,title");
+  t_str("sorted", t_body(h), "{{\"items\":[{{\"id\":4,\"title\":\"jam\"},{{\"id\":1,\"title\":\"milk\"},{{\"id\":3,\"title\":\"Bread\"},{{\"id\":6,\"title\":\"rice\"},{{\"id\":2,\"title\":\"eggs\"}],\"total\":6,\"limit\":5,\"offset\":0}");
+
+  h = get(api, "/api/items", "filter[done]=true&filter[prio][gte]=2&limit=5");
+  t_has("filtered", t_body(h), "\"total\":2");
+  h = get(api, "/api/items", "filter[title][contains]=E&limit=5");
+  t_has("contains", t_body(h), "\"total\":4");
+  h = get(api, "/api/items", "filter[prio][in]=1,2&limit=5");
+  t_has("in", t_body(h), "\"total\":4");
+
+  h = get(api, "/api/items", "sort=nope&filter[id]=1&filter[prio][xx]=1&filter[prio]=a&fields=zz");
+  t_eq("bad", t_status(h), 400);
+  t_has("bad sort", t_body(h), "'nope' is not a field you can sort on");
+  t_has("bad filter field", t_body(h), "\"parameter\":\"filter[id]\"");
+  t_has("bad op", t_body(h), "the operator must be");
+  t_has("bad value", t_body(h), "must be an integer");
+  t_has("bad fields", t_body(h), "'zz' is not a field");
+  h = get(api, "/api/items", "limit=0");
+  t_eq("bad limit", t_status(h), 400);
+  t_has("bad limit body", t_body(h), "\"parameter\":\"limit\"");
+
+  h = get(api, "/api/feed", "");
+  t_has("feed", t_body(h), "\"limit\":4,\"next_cursor\":\"NA\"}");
+  t_str("feed links", t_hdr(h, "Link"), "</api/feed?limit=4>; rel=\"first\", </api/feed?limit=4&cursor=NA>; rel=\"next\"");
+  h = get(api, "/api/feed", "cursor=NA");
+  t_str("feed 2", t_body(h), "{{\"items\":[{{\"id\":5,\"title\":\"tea\",\"prio\":1,\"done\":true},{{\"id\":6,\"title\":\"rice\",\"prio\":2,\"done\":false}],\"limit\":4,\"next_cursor\":null}");
+  h = get(api, "/api/feed", "cursor=!!");
+  t_eq("bad cursor", t_status(h), 400);
+
+  var a: RzArena* = rz_arena_new();
+  var back: int64 = 0;
+  t_ok("cursor round trip", rapi_cursor_decode(rapi_cursor_encode(1234567, a), &back) && back == 1234567);
+  t_ok("cursor junk", !rapi_cursor_decode("A", &back) && !rapi_cursor_decode("", &back));
+
+  h = get(api, "/api/openapi.json", "");
+  t_has("doc deepObject", t_body(h), "\"name\":\"filter\",\"in\":\"query\"");
+  t_has("doc page", t_body(h), "\"ItemPage\":{{\"type\":\"object\"");
+  return t_done();
+}

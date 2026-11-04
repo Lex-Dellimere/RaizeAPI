@@ -84,6 +84,7 @@ export struct RapiOp {
   max_body: int64;                 // bytes, 0 means the API's limit
   ud: rawptr;                      // for the app: any pointer the handler wants (rapi_op_data)
   ud2: rawptr;                     // for raize_api's own generated operations
+  listing: rawptr;                 // query/: the RapiListing of a list operation, or 0
 }
 
 /// A parsed parameter value.

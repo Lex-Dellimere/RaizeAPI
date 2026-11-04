@@ -1,0 +1,101 @@
+// REST operations derived from a raize resource over the memory layer.
+import "std/mem";
+import "raize_core/core/status";
+import "raize_resource/resource";
+import "raize_api/raize_api";
+import "raize_api/rest/rest";
+import "tutil";
+import "http";
+
+struct Note { id: int64; title: string; stars: int32; pinned: bool; }
+
+var g_def: RzResourceDef;
+
+fn note_pin(rec: rawptr) {
+  var n: Note* = (Note*)rec;
+  n->pinned = !n->pinned;
+}
+
+fn note_def() -> RzResourceDef* {
+  memset((rawptr)&g_def, 0, (int64)sizeof(RzResourceDef));
+  rz__resource_begin(&g_def, "note", "Note", (int64)sizeof(Note));
+  comptime for f in typeof(Note).fields {
+    rz__resource_field(&g_def, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
+  rz__attr_required(&g_def, 1);
+  rz__attr_max_length(&g_def, 1, 10);
+  rz__action_create(&g_def, (int64)6);
+  rz__action_read(&g_def);
+  rz__action_update(&g_def, (int64)14);
+  rz__action_destroy(&g_def);
+  rz__action_custom(&g_def, "pin", &note_pin);
+  rz__resource_end(&g_def);
+  return &g_def;
+}
+
+fn call(api: RapiApi*, verb: string, path: string, query: string, body: string) -> THttp* {
+  var hdr: string = "";
+  if (body.length > 0) { hdr = "Content-Type: application/json"; }
+  var h: THttp* = t_req(verb, path, query, body, hdr);
+  rapi_handle(api, &h->ctx);
+  return h;
+}
+
+fn main() -> int32 {
+  var def: RzResourceDef* = note_def();
+  var dl: RzDataLayer* = rz_mem_layer_new(def, 3);
+  var api: RapiApi* = rapi_new((RzApp*)0, "/api", "Notes", "1");
+  rapi_group(api, "/v1");
+  rapi_resource(api, "/notes", def, dl);
+  rapi_group_end(api);
+  t_str("decl", rapi_error(api), "");
+
+  var h: THttp* = call(api, "POST", "/api/v1/notes", "", "{{\"title\":\"  hi \",\"stars\":2}");
+  t_eq("create", t_status(h), 201);
+  t_str("create body", t_body(h), "{{\"id\":1,\"title\":\"hi\",\"stars\":2,\"pinned\":false}");
+  t_str("location", t_hdr(h, "Location"), "/api/v1/notes/1");
+
+  h = call(api, "POST", "/api/v1/notes", "", "{{\"title\":\"   \"}");
+  t_eq("blank", t_status(h), 422);
+  t_has("blank body", t_body(h), "\"pointer\":\"#/title\"");
+  h = call(api, "POST", "/api/v1/notes", "", "{{\"stars\":1}");
+  t_eq("missing title", t_status(h), 422);
+  h = call(api, "POST", "/api/v1/notes", "", "{{\"title\":\"x\",\"pinned\":true}");
+  t_eq("unaccepted", t_status(h), 422);
+  t_has("unaccepted body", t_body(h), "{{\"detail\":\"is not allowed\",\"pointer\":\"#/pinned\"}");
+  h = call(api, "POST", "/api/v1/notes", "", "{{\"title\":\"01234567890\"}");
+  t_eq("too long", t_status(h), 422);
+
+  call(api, "POST", "/api/v1/notes", "", "{{\"title\":\"b\",\"stars\":5}");
+  call(api, "POST", "/api/v1/notes", "", "{{\"title\":\"c\",\"stars\":3}");
+  h = call(api, "POST", "/api/v1/notes", "", "{{\"title\":\"d\"}");
+  t_eq("full", t_status(h), 409);
+
+  h = call(api, "GET", "/api/v1/notes", "sort=-stars&fields=id,stars", "");
+  t_str("list", t_body(h), "{{\"items\":[{{\"id\":2,\"stars\":5},{{\"id\":3,\"stars\":3},{{\"id\":1,\"stars\":2}],\"total\":3,\"limit\":50,\"offset\":0}");
+
+  h = call(api, "GET", "/api/v1/notes/2", "", "");
+  t_str("get", t_body(h), "{{\"id\":2,\"title\":\"b\",\"stars\":5,\"pinned\":false}");
+  h = call(api, "GET", "/api/v1/notes/9", "", "");
+  t_eq("get 404", t_status(h), 404);
+  t_has("get 404 body", t_body(h), "no record with id 9");
+
+  h = call(api, "PATCH", "/api/v1/notes/2", "", "{{\"stars\":1}");
+  t_str("patch", t_body(h), "{{\"id\":2,\"title\":\"b\",\"stars\":1,\"pinned\":false}");
+  h = call(api, "PATCH", "/api/v1/notes/2", "", "{{\"title\":\"\"}");
+  t_eq("patch invalid", t_status(h), 422);
+
+  h = call(api, "POST", "/api/v1/notes/2/pin", "", "");
+  t_str("pin", t_body(h), "{{\"id\":2,\"title\":\"b\",\"stars\":1,\"pinned\":true}");
+
+  h = call(api, "DELETE", "/api/v1/notes/2", "", "");
+  t_eq("delete", t_status(h), 204);
+  h = call(api, "DELETE", "/api/v1/notes/2", "", "");
+  t_eq("delete again", t_status(h), 404);
+
+  h = call(api, "GET", "/api/openapi.json", "", "");
+  t_has("doc create", t_body(h), "\"NoteCreate\":{{\"type\":\"object\",\"properties\":{{\"title\":{{\"type\":\"string\",\"maxLength\":10},\"stars\":{{\"type\":\"integer\",\"format\":\"int32\"}},\"required\":[\"title\"],\"additionalProperties\":false}");
+  t_has("doc custom", t_body(h), "\"/v1/notes/{{id}/pin\":{{\"post\"");
+  rz_data_layer_free(dl);
+  return t_done();
+}
