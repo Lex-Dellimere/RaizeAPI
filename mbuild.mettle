@@ -13,11 +13,11 @@ fn project() {
 
 // raize packages by path until raize is published; publish switches these to mb_dep.
 fn deps() {
-  mb_dep_path("raize_core", "../raize_web/libs/core");
-  mb_dep_path("raize_resource", "../raize_web/libs/resource");
-  mb_dep_path("raize_app", "../raize_web/libs/app");
-  mb_dep_path("codec", "../codec");
-  mb_dep_path("press", "../press");
+  mb_dep_path("raize_core", "../core");
+  mb_dep_path("raize_resource", "../resource");
+  mb_dep_path("raize_app", "../app");
+  mb_dep_path("codec", "../../../codec");
+  mb_dep_path("press", "../../../press");
   mb_dep("json", "v1.0.0");
 }
 
